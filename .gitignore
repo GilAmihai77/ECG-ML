@@ -1,0 +1,31 @@
+# Dataset and derived artifacts.
+# Leading slash is required: a bare "data/" would also match src/ecg/data/,
+# silently excluding the data-loading package from the repo.
+/data/
+*.zip
+
+# Experiment outputs
+mlruns/
+mlartifacts/
+outputs/
+checkpoints/
+*.ckpt
+*.pt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Environments / editors
+.venv/
+.env
+.vscode/
+.idea/
