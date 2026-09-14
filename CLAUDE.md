@@ -3,9 +3,21 @@ Write modular code, with typehints and docstrings.
 Keep codebase organized and easy to understand. Whenever possible import code instead of rewriting.
 There are some stages- I will give you a stage at a time. When its working ok + tests- we proceed. 
 
-I will start working localy, but for bigger transformer we will need cloud GPU- runpod or AWS. So we first run localy on a small transformer, then in cloud with bigger model.
+I will start working localy, but for bigger transformer we will need cloud GPU-
+colab or runpod. So we first run localy on a small transformer, then in cloud
+with bigger model.
 
 Local python in D:/conda/envs/torch
+Note: the local torch is a CPU-only build (2.12.0+cpu) and the local GPU is a
+GTX 1050 4GB. Local runs are for smoke tests only; every real run is cloud.
+
+Because the cloud target is Colab/RunPod, whose filesystems are ephemeral:
+- Preprocess ONCE into a single compact array committed to Drive or a RunPod
+  volume. The training path must not depend on wfdb or neurokit2 - those are
+  preprocessing-only, so cloud setup stays small and fast.
+- Checkpoint often and to persistent storage. Colab disconnects.
+- MLflow must log somewhere that survives the session. A local mlruns/ on Colab
+  is lost on disconnect.
 
 If possible I want all experiments tracked by mlflow.
 
