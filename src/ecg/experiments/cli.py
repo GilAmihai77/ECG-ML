@@ -12,6 +12,7 @@ that was interrupted.
 from __future__ import annotations
 
 import argparse
+import warnings
 from pathlib import Path
 
 from ecg.experiments.plan import (
@@ -53,8 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="runs", help="Directory for run outputs.")
     parser.add_argument(
         "--tracking",
-        default=None,
-        help="Tracking database path. Defaults to <output>/mlflow.db.",
+        default="mlruns/mlflow.db",
+        help=(
+            "Tracking database. Keep it on LOCAL disk: SQLite locking assumes "
+            "POSIX semantics a Drive FUSE mount does not honour. A consistent "
+            "copy is written to the output directory every epoch."
+        ),
     )
     parser.add_argument("--experiment", default="ecg-ssl", help="MLflow experiment.")
     parser.add_argument("--epochs", type=int, default=50)
@@ -95,6 +100,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: Path fragments that indicate a network/FUSE mount where SQLite is unsafe.
+_MOUNT_MARKERS: tuple[str, ...] = ("/drive/", "\\drive\\", "/gdrive/")
+
+
+def warn_if_mounted(tracking_uri: str) -> None:
+    """Warn when the tracking database would live on a FUSE mount.
+
+    SQLite's locking assumes POSIX semantics that Google Drive's FUSE layer
+    does not provide, and the failure mode is a corrupt database rather than an
+    error at write time. The database belongs on local disk; a consistent copy
+    reaches durable storage every epoch through
+    :func:`ecg.training.checkpoints.sync_tracking`.
+
+    Args:
+        tracking_uri: The configured tracking path.
+    """
+    lowered = str(tracking_uri).lower()
+    if any(marker in lowered for marker in _MOUNT_MARKERS):
+        warnings.warn(
+            f"tracking database {tracking_uri!r} looks like it is on a mounted "
+            "drive. SQLite over FUSE can corrupt silently; point --tracking at "
+            "local disk instead. It is copied to --output every epoch anyway.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
 def base_config(args: argparse.Namespace) -> RunConfig:
     """Assemble the base configuration every run is derived from.
 
@@ -105,6 +137,7 @@ def base_config(args: argparse.Namespace) -> RunConfig:
         The base configuration.
     """
     output = Path(args.output)
+    warn_if_mounted(args.tracking)
     return RunConfig(
         model=ModelConfig(
             d_model=args.d_model, n_layers=args.n_layers, n_heads=args.n_heads
@@ -123,7 +156,7 @@ def base_config(args: argparse.Namespace) -> RunConfig:
         metadata_path=args.metadata,
         subset_seed=args.seed,
         experiment=args.experiment,
-        tracking_uri=args.tracking or str(output / "mlflow.db"),
+        tracking_uri=args.tracking,
         output_dir=str(output),
     )
 

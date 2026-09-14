@@ -653,3 +653,29 @@ class TestRecordPath:
         layout = resolve_layout(dataset_root)
         with pytest.raises(ValueError, match="must be 100 or 500"):
             record_path(layout, metadata.loc[1], 250)  # type: ignore[arg-type]
+
+
+class TestMetadataOnlyLayout:
+    """Metadata must load without the 3 GB record trees.
+
+    The cloud runs copy the preprocessed store to Drive, not the WFDB files, so
+    load_metadata has to work from the two CSVs alone.
+    """
+
+    def test_loads_without_record_directories(self, tmp_path) -> None:
+        from tests.conftest import SCP_STATEMENTS, database_csv
+
+        root = tmp_path / "metadata_only"
+        root.mkdir()
+        (root / "ptbxl_database.csv").write_text(database_csv(), encoding="utf-8")
+        (root / "scp_statements.csv").write_text(SCP_STATEMENTS, encoding="utf-8")
+
+        frame = load_metadata(root)
+        assert len(frame) == 60
+        assert "split" in frame.columns
+
+    def test_missing_csv_is_still_loud(self, tmp_path) -> None:
+        root = tmp_path / "empty"
+        root.mkdir()
+        with pytest.raises(FileNotFoundError, match="ptbxl_database.csv"):
+            load_metadata(root)

@@ -52,10 +52,15 @@ PTBXL_S3_ZIP_URL = f"https://physionet-open.s3.amazonaws.com/ptb-xl/ptb-xl-{PTBX
 #: Named sources selectable from the command line.
 MIRRORS: dict[str, str] = {"s3": PTBXL_S3_ZIP_URL, "physionet": PTBXL_ZIP_URL}
 
-#: Entries that must exist for an extraction to count as complete.
-REQUIRED_ENTRIES: tuple[str, ...] = (
+#: The two CSVs that :func:`ecg.data.ptbxl.load_metadata` actually reads.
+METADATA_ENTRIES: tuple[str, ...] = (
     "ptbxl_database.csv",
     "scp_statements.csv",
+)
+
+#: Entries that must exist for an extraction to count as complete.
+REQUIRED_ENTRIES: tuple[str, ...] = (
+    *METADATA_ENTRIES,
     "records100",
     "records500",
 )
@@ -469,11 +474,17 @@ def extract_archive(zip_path: Path, dest: Path) -> Path:
     return dest
 
 
-def resolve_layout(root: Path) -> DatasetLayout:
+def resolve_layout(root: Path, *, require_waveforms: bool = True) -> DatasetLayout:
     """Validate an extracted PTB-XL directory and resolve its key paths.
 
     Args:
         root: Directory expected to contain ``ptbxl_database.csv``.
+        require_waveforms: Require the ``records100`` and ``records500`` trees.
+            Set ``False`` when only the metadata CSVs are needed. That is the
+            cloud case: the waveforms are already baked into the preprocessed
+            store, so copying the 3 GB record trees to Drive alongside it would
+            be 3 GB for nothing. The returned layout still names the record
+            directories; they simply may not exist.
 
     Returns:
         The resolved :class:`DatasetLayout`.
@@ -484,7 +495,8 @@ def resolve_layout(root: Path) -> DatasetLayout:
             run rather than one failure at a time.
     """
     root = Path(root)
-    missing = [name for name in REQUIRED_ENTRIES if not (root / name).exists()]
+    required = REQUIRED_ENTRIES if require_waveforms else METADATA_ENTRIES
+    missing = [name for name in required if not (root / name).exists()]
     if missing:
         raise FileNotFoundError(
             f"PTB-XL at {root} is incomplete; missing: {', '.join(missing)}"

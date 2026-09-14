@@ -246,7 +246,10 @@ def load_metadata(
         * ``age_censored``: ``True`` where age hit the >89 sentinel.
     """
     if not isinstance(layout, DatasetLayout):
-        layout = resolve_layout(Path(layout))
+        # Only the two CSVs are read here, so the record trees need not be
+        # present. On the cloud they are not: the waveforms live in the
+        # preprocessed store and the 3 GB of WFDB files stay off Drive.
+        layout = resolve_layout(Path(layout), require_waveforms=False)
 
     df = pd.read_csv(layout.database_csv, index_col="ecg_id")
     superclass_map = build_superclass_map(layout)

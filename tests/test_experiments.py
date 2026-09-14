@@ -324,9 +324,25 @@ class TestCli:
         assert config.ssl.mask_ratio == 0.7
         assert config.train.amp is False
 
-    def test_tracking_defaults_beside_the_output(self, tmp_path) -> None:
+    def test_tracking_defaults_to_local_disk_not_the_output(self, tmp_path) -> None:
+        """The output goes to Drive; SQLite must not follow it there."""
         args = build_parser().parse_args(["--output", str(tmp_path / "runs")])
-        assert base_config(args).tracking_uri.endswith("mlflow.db")
+        tracking = base_config(args).tracking_uri
+        assert tracking == "mlruns/mlflow.db"
+        assert str(tmp_path) not in tracking
+
+    def test_tracking_on_a_mounted_drive_warns(self) -> None:
+        """SQLite over FUSE corrupts silently; an error would be preferable,
+        but the path cannot be proven remote, so warn."""
+        args = build_parser().parse_args(
+            ["--tracking", "/content/drive/MyDrive/ecg/mlflow.db"]
+        )
+        with pytest.warns(RuntimeWarning, match="mounted drive"):
+            base_config(args)
+
+    def test_local_tracking_does_not_warn(self, recwarn) -> None:
+        base_config(build_parser().parse_args(["--tracking", "/content/mlflow.db"]))
+        assert not [w for w in recwarn if "mounted drive" in str(w.message)]
 
     def test_cloud_defaults_are_the_intended_ones(self) -> None:
         """The command run on the A100 should need no extra flags."""
