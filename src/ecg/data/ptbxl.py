@@ -487,6 +487,159 @@ def quality_flag_summary(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).rename_axis("quality_flag")
 
 
+#: Reasons a record is withheld from the *supervised* training set. Order is
+#: fixed so manifests and reports stay comparable across runs.
+SUPERVISED_EXCLUSION_REASONS: tuple[str, ...] = (
+    "pacemaker",
+    "electrodes_problems",
+    "not_validated_by_human",
+)
+
+
+def supervised_exclusion_mask(df: pd.DataFrame) -> pd.DataFrame:
+    """Flag, per record, each reason it is unfit for supervised training.
+
+    Three independent concerns, deliberately kept separate rather than collapsed
+    into a single boolean:
+
+    * ``pacemaker`` -- paced rhythms have artificially regular RR intervals and
+      atypical QRS morphology, making them unrepresentative input for a beat
+      tokenizer.
+    * ``electrodes_problems`` -- the recording itself is suspect.
+    * ``not_validated_by_human`` -- the label was never checked by a
+      cardiologist, so it is weak supervision.
+
+    A record may trip more than one reason; the columns are not mutually
+    exclusive.
+
+    Args:
+        df: Metadata frame from :func:`load_metadata`.
+
+    Returns:
+        Boolean DataFrame indexed like ``df``, one column per entry in
+        :data:`SUPERVISED_EXCLUSION_REASONS`, plus an ``any`` column.
+    """
+
+    def flagged(column: str) -> pd.Series:
+        """Treat a free-text annotation column as set when non-empty."""
+        values = df[column]
+        return values.notna() & (values.astype(str).str.strip() != "")
+
+    mask = pd.DataFrame(index=df.index)
+    mask["pacemaker"] = flagged("pacemaker")
+    mask["electrodes_problems"] = flagged("electrodes_problems")
+    mask["not_validated_by_human"] = ~_as_bool(df["validated_by_human"])
+    mask["any"] = mask[list(SUPERVISED_EXCLUSION_REASONS)].any(axis=1)
+    return mask
+
+
+def supervised_exclusion_manifest(df: pd.DataFrame) -> pd.DataFrame:
+    """Build the record-level manifest of everything the filter removes.
+
+    Integrity rule 8 requires unusable records to be reported rather than
+    silently dropped, so the excluded set is materialised as data that can be
+    saved alongside a run.
+
+    Args:
+        df: Metadata frame from :func:`load_metadata`.
+
+    Returns:
+        One row per excluded record, indexed by ``ecg_id``, carrying the fold,
+        the labels it would have contributed, and a ``reasons`` string listing
+        every reason that applied.
+    """
+    mask = supervised_exclusion_mask(df)
+    excluded = mask.index[mask["any"]]
+    reasons = mask.loc[excluded, list(SUPERVISED_EXCLUSION_REASONS)].apply(
+        lambda row: "+".join(name for name, hit in row.items() if hit), axis=1
+    )
+    return pd.DataFrame(
+        {
+            "strat_fold": df.loc[excluded, "strat_fold"],
+            "split": df.loc[excluded, "split"],
+            "superclasses": df.loc[excluded, "superclasses"].apply(",".join),
+            "reasons": reasons,
+        }
+    )
+
+
+def apply_supervised_filter(
+    df: pd.DataFrame,
+    *,
+    splits: tuple[str, ...] = ("train",),
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Remove records unfit for supervised training from the chosen splits.
+
+    By default the filter touches the training split only. Validation and test
+    are left whole, so the held-out metric keeps describing the population the
+    model will actually meet rather than a cleaner one.
+
+    This filter is for the **supervised** arms only. SSL pretraining uses every
+    record in the training folds, filtered or not, because it needs no labels.
+    Folds 9 and 10 are excluded from pretraining entirely.
+
+    Args:
+        df: Metadata frame from :func:`load_metadata`.
+        splits: Which splits to apply the filter to.
+
+    Returns:
+        Tuple of ``(kept, manifest)``: the retained records, and the manifest of
+        what was removed, restricted to ``splits``.
+    """
+    mask = supervised_exclusion_mask(df)
+    drop = mask["any"] & df["split"].isin(splits)
+    manifest = supervised_exclusion_manifest(df)
+    manifest = manifest[manifest["split"].isin(splits)]
+    return df[~drop].copy(), manifest
+
+
+def exclusion_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Tabulate how many records each exclusion reason removes, per split.
+
+    Reasons overlap, so the per-reason columns do not sum to ``excluded_any``.
+
+    Args:
+        df: Metadata frame from :func:`load_metadata`.
+
+    Returns:
+        DataFrame indexed by split with one column per reason, the combined
+        count, and the resulting retention percentage.
+    """
+    mask = supervised_exclusion_mask(df)
+    rows: list[pd.Series] = []
+    for split in ("train", "val", "test"):
+        selector = df["split"] == split
+        total = int(selector.sum())
+        if not total:
+            continue
+        row = {"n_records": total}
+        for reason in SUPERVISED_EXCLUSION_REASONS:
+            row[reason] = int(mask.loc[selector, reason].sum())
+        row["excluded_any"] = int(mask.loc[selector, "any"].sum())
+        row["retained"] = total - row["excluded_any"]
+        row["retained_%"] = round(100.0 * row["retained"] / total, 2)
+        rows.append(pd.Series(row, name=split))
+    return pd.DataFrame(rows).rename_axis("split")
+
+
+def ssl_pretraining_pool(df: pd.DataFrame) -> pd.DataFrame:
+    """Select the records available for self-supervised pretraining.
+
+    Every record in the training folds is eligible, including those the
+    supervised filter rejects: SSL needs no labels, so weak or absent
+    annotation is no obstacle, and paced or noisy recordings are still valid
+    signal to learn representations from. Folds 9 and 10 are excluded outright,
+    since pretraining on held-out waveforms would leak them into the model.
+
+    Args:
+        df: Metadata frame from :func:`load_metadata`.
+
+    Returns:
+        The subset of ``df`` in the training folds.
+    """
+    return df[df["strat_fold"].isin(TRAIN_FOLDS)].copy()
+
+
 def record_path(layout: DatasetLayout, row: pd.Series, sampling_rate: SamplingRate) -> Path:
     """Resolve the on-disk waveform path for one record.
 
