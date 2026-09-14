@@ -26,6 +26,30 @@ from torch import nn
 from ecg.models.config import CONV_NORM_GROUPS, ModelConfig
 
 
+def patchify(signal: torch.Tensor, config: ModelConfig) -> torch.Tensor:
+    """Cut a signal batch into flattened patches.
+
+    Used both by :class:`LinearPatchEmbedding` and by the SSL reconstruction
+    target, so the prediction and the thing it is compared against cannot end
+    up in different layouts. The patch is laid out lead-major -- all
+    ``patch_samples`` of lead I, then all of lead II, and so on -- so a single
+    weight row spans one lead's whole window.
+
+    Args:
+        signal: ``(batch, n_leads, n_samples)`` float tensor.
+        config: Model configuration supplying the patch geometry.
+
+    Returns:
+        ``(batch, n_tokens, patch_features)`` tensor, where patch ``p`` holds
+        samples ``[p * patch_samples, (p + 1) * patch_samples)``.
+    """
+    batch, leads, _ = signal.shape
+    patches = signal.reshape(batch, leads, config.n_tokens, config.patch_samples)
+    return patches.permute(0, 2, 1, 3).reshape(
+        batch, config.n_tokens, config.patch_features
+    )
+
+
 class LinearPatchEmbedding(nn.Module):
     """Flatten each patch across all leads and project it once.
 
@@ -69,15 +93,7 @@ class LinearPatchEmbedding(nn.Module):
             ValueError: If the input shape does not match the configuration.
         """
         _check_input(signal, self.config)
-        batch, leads, _ = signal.shape
-        patches = signal.reshape(
-            batch, leads, self.config.n_tokens, self.config.patch_samples
-        )
-        # (batch, token, lead, sample) -> flatten lead-major within the patch.
-        patches = patches.permute(0, 2, 1, 3).reshape(
-            batch, self.config.n_tokens, self.config.patch_features
-        )
-        return self.project(patches)
+        return self.project(patchify(signal, self.config))
 
 
 class ConvPatchEmbedding(nn.Module):

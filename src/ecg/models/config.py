@@ -251,3 +251,92 @@ class ModelConfig:
             A new configuration.
         """
         return replace(self, embedder=embedder)
+
+
+@dataclass(frozen=True)
+class SslConfig:
+    """Masked-reconstruction pretraining settings, shared by arms C and D.
+
+    The defaults are argued rather than inherited. **0.5** rather than MAE's
+    0.75 because this encoder *sees* the masked tokens -- they are blanked in
+    the raw signal and still flow through the stem -- so a high ratio leaves
+    the encoder pretrained on mostly-empty input and fine-tuned on full input.
+    MAE could afford 0.75 only because it drops masked patches before its
+    encoder entirely. And **0.5** rather than BERT's 0.15 because a 10-second
+    ECG holds roughly ten near-identical beats, so a sparse mask is filled by
+    copying a neighbour.
+
+    **Span 2** because one token is 500 ms and one RR interval at 60-75 bpm is
+    800-1000 ms: a single-token hole is always shorter than a beat and invites
+    within-beat interpolation instead of morphology.
+
+    These must be identical in arms C and D. Tuning the mask per arm would make
+    the SSL stage part of what is being compared.
+
+    Attributes:
+        mask_ratio: Fraction of tokens masked per record.
+        mask_span: Tokens per contiguous block. Raise this before raising
+            ``mask_ratio`` if pretraining loss plateaus early -- the
+            encoder-sees-masks problem worsens with ratio but not with span.
+    """
+
+    mask_ratio: float = 0.5
+    mask_span: int = 2
+
+    def __post_init__(self) -> None:
+        """Validate the mask settings.
+
+        Raises:
+            ValueError: If the ratio is outside ``(0, 1)`` or the span is not
+                at least one token.
+        """
+        if not 0.0 < self.mask_ratio < 1.0:
+            raise ValueError(
+                f"mask_ratio must be in (0, 1), got {self.mask_ratio}; a mask "
+                "that hides everything or nothing has no pretext task"
+            )
+        if self.mask_span < 1:
+            raise ValueError(f"mask_span must be at least 1, got {self.mask_span}")
+
+    def n_masked_tokens(self, n_tokens: int) -> int:
+        """Tokens masked per record, held constant across records and steps.
+
+        Args:
+            n_tokens: Tokens per record.
+
+        Returns:
+            Masked token count, at least one and at least one short of
+            ``n_tokens``.
+
+        Raises:
+            ValueError: If the ratio leaves no masked or no visible tokens at
+                this sequence length -- with only 20 tokens, a ratio below
+                0.025 rounds away to nothing.
+        """
+        count = int(round(n_tokens * self.mask_ratio))
+        if count < 1 or count >= n_tokens:
+            raise ValueError(
+                f"mask_ratio {self.mask_ratio} masks {count} of {n_tokens} "
+                "tokens; need at least one masked and one visible"
+            )
+        return count
+
+    def block_sizes(self, n_tokens: int) -> tuple[int, ...]:
+        """Block lengths summing to the masked token count.
+
+        Full-span blocks first, then one shorter block for the remainder, so
+        the masked count is exact rather than rounded to a multiple of the
+        span.
+
+        Args:
+            n_tokens: Tokens per record.
+
+        Returns:
+            Block lengths, e.g. ``(2, 2, 2, 2, 2)`` at the defaults.
+        """
+        total = self.n_masked_tokens(n_tokens)
+        sizes = [self.mask_span] * (total // self.mask_span)
+        remainder = total % self.mask_span
+        if remainder:
+            sizes.append(remainder)
+        return tuple(sizes)
