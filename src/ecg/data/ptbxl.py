@@ -20,7 +20,7 @@ Key conventions, fixed here rather than at each call site:
 from __future__ import annotations
 
 import ast
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -490,8 +490,9 @@ def quality_flag_summary(df: pd.DataFrame) -> pd.DataFrame:
 #: The four pathological superclasses -- every class except ``NORM``.
 PATHOLOGY_CLASSES: tuple[str, ...] = tuple(c for c in SUPERCLASSES if c != "NORM")
 
-#: Reasons a record is withheld from the *supervised* training set. Order is
-#: fixed so manifests and reports stay comparable across runs.
+#: Per-record reasons a record is withheld from the *supervised* training set.
+#: Each depends only on that record, so they can be evaluated independently.
+#: Order is fixed so manifests and reports stay comparable across runs.
 SUPERVISED_EXCLUSION_REASONS: tuple[str, ...] = (
     "pacemaker",
     "electrodes_problems",
@@ -499,6 +500,43 @@ SUPERVISED_EXCLUSION_REASONS: tuple[str, ...] = (
     "unlabelled",
     "norm_with_pathology",
 )
+
+#: Exclusion reason that is *not* per-record: whether a record is kept depends
+#: on its patient's other records, so it is resolved after the independent
+#: rules. See :func:`duplicate_patient_mask`.
+DUPLICATE_REASON: str = "duplicate_patient_record"
+
+#: Every reason that can appear in an exclusion manifest.
+ALL_EXCLUSION_REASONS: tuple[str, ...] = (*SUPERVISED_EXCLUSION_REASONS, DUPLICATE_REASON)
+
+#: Reasons the label itself cannot be scored against a 5-class target: the
+#: record has no superclass at all, or asserts NORM together with a pathology.
+#: These apply to **every** split, held-out folds included. Keeping such records
+#: in val or test would not make the evaluation more realistic -- an unlabelled
+#: record scores as all-negative and a contradictory one is unwinnable by
+#: construction, so they impose an arbitrary ceiling rather than measuring
+#: anything about the model.
+LABEL_VALIDITY_REASONS: tuple[str, ...] = ("unlabelled", "norm_with_pathology")
+
+#: Reasons that shape the training cohort rather than establish label validity:
+#: signal quality, annotation strength, and one-record-per-patient weighting.
+#: These apply to the training split only. Applying them to val or test would
+#: make the held-out metric describe a cleaner population than the real one.
+COHORT_QUALITY_REASONS: tuple[str, ...] = (
+    "pacemaker",
+    "electrodes_problems",
+    "not_validated_by_human",
+    DUPLICATE_REASON,
+)
+
+#: Which exclusion reasons apply to which split. The asymmetry is deliberate:
+#: training drops everything, while the held-out folds drop only records whose
+#: labels cannot be scored at all.
+DEFAULT_EXCLUSION_POLICY: dict[str, tuple[str, ...]] = {
+    "train": ALL_EXCLUSION_REASONS,
+    "val": LABEL_VALIDITY_REASONS,
+    "test": LABEL_VALIDITY_REASONS,
+}
 
 
 def supervised_exclusion_mask(df: pd.DataFrame) -> pd.DataFrame:
@@ -547,7 +585,131 @@ def supervised_exclusion_mask(df: pd.DataFrame) -> pd.DataFrame:
     return mask
 
 
-def supervised_exclusion_manifest(df: pd.DataFrame) -> pd.DataFrame:
+def _record_order(df: pd.DataFrame) -> pd.DataFrame:
+    """Build the deterministic ordering used to decide which record is "first".
+
+    Records are ordered by recording date, with ``ecg_id`` breaking ties so the
+    result never depends on row order or pandas version (integrity rule 6).
+    Unparseable dates sort last, so a record with a usable date is always
+    preferred over one without.
+
+    Args:
+        df: Metadata frame containing ``recording_date``.
+
+    Returns:
+        DataFrame indexed like ``df`` with ``_date`` and ``_record_id`` sort
+        columns. The names are prefixed because the frame's index is itself
+        named ``ecg_id``, and pandas refuses to sort on a key that is both an
+        index level and a column.
+    """
+    order = pd.DataFrame(index=df.index)
+    order["_date"] = pd.to_datetime(df["recording_date"], errors="coerce")
+    order["_record_id"] = df.index.to_numpy()
+    return order
+
+
+def duplicate_patient_mask(df: pd.DataFrame, *, eligible: pd.Series) -> pd.Series:
+    """Flag records that are not their patient's earliest *eligible* recording.
+
+    A patient contributing several recordings would otherwise be counted several
+    times in the loss, weighting the model towards whoever was recorded most
+    often. Keeping one recording per patient makes every patient contribute
+    equally.
+
+    ``eligible`` decides the candidate pool, and the distinction matters: the
+    per-record rules are applied *first*, so this keeps the earliest recording
+    that survived them rather than the earliest overall. Resolving it the other
+    way would discard a patient entirely whenever their first recording happened
+    to be unvalidated or paced, losing usable data for no benefit.
+
+    Args:
+        df: Metadata frame from :func:`load_metadata`.
+        eligible: Boolean Series marking records still in the running.
+
+    Returns:
+        Boolean Series indexed like ``df``, ``True`` for records to drop as
+        duplicates.
+    """
+    flags = pd.Series(False, index=df.index)
+    candidates = df[eligible]
+    if candidates.empty:
+        return flags
+
+    order = _record_order(candidates)
+    ranked = order.sort_values(["_date", "_record_id"], na_position="last")
+    keep = (
+        candidates.loc[ranked.index]
+        .groupby("patient_id", sort=False)
+        .head(1)
+        .index
+    )
+    flags.loc[candidates.index.difference(keep)] = True
+    return flags
+
+
+def supervised_drop_reasons(
+    df: pd.DataFrame,
+    *,
+    policy: Mapping[str, Sequence[str]] | None = None,
+) -> pd.DataFrame:
+    """Resolve every exclusion reason, per record, under an exclusion policy.
+
+    Combines the independent per-record rules with the patient de-duplication
+    step, which can only be decided once the others have been applied, and
+    applies each split the rule set its policy entry names.
+
+    Args:
+        df: Metadata frame from :func:`load_metadata`.
+        policy: Mapping of split name to the reasons that apply to it. Defaults
+            to :data:`DEFAULT_EXCLUSION_POLICY`. A split absent from the mapping
+            keeps every record.
+
+    Returns:
+        Boolean DataFrame indexed like ``df`` with one column per entry in
+        :data:`ALL_EXCLUSION_REASONS`, plus an ``any`` column.
+
+    Raises:
+        ValueError: If the policy names a reason that does not exist, which
+            would otherwise silently skip a rule the caller believed was active.
+    """
+    policy = DEFAULT_EXCLUSION_POLICY if policy is None else dict(policy)
+
+    unknown = {r for reasons in policy.values() for r in reasons} - set(
+        ALL_EXCLUSION_REASONS
+    )
+    if unknown:
+        raise ValueError(
+            f"Unknown exclusion reason(s): {', '.join(sorted(unknown))}. "
+            f"Valid reasons: {', '.join(ALL_EXCLUSION_REASONS)}"
+        )
+
+    per_record = supervised_exclusion_mask(df)
+    reasons = pd.DataFrame(
+        False, index=df.index, columns=list(ALL_EXCLUSION_REASONS), dtype=bool
+    )
+
+    for split, split_reasons in policy.items():
+        selector = (df["split"] == split).to_numpy()
+        for reason in split_reasons:
+            if reason == DUPLICATE_REASON:
+                continue  # resolved below, once the others are known
+            reasons.loc[selector, reason] = per_record.loc[selector, reason]
+
+    dedup_splits = [s for s, rs in policy.items() if DUPLICATE_REASON in rs]
+    if dedup_splits:
+        in_scope = df["split"].isin(dedup_splits)
+        survivors = in_scope & ~reasons[list(SUPERVISED_EXCLUSION_REASONS)].any(axis=1)
+        reasons[DUPLICATE_REASON] = duplicate_patient_mask(df, eligible=survivors)
+
+    reasons["any"] = reasons[list(ALL_EXCLUSION_REASONS)].any(axis=1)
+    return reasons
+
+
+def supervised_exclusion_manifest(
+    df: pd.DataFrame,
+    *,
+    policy: Mapping[str, Sequence[str]] | None = None,
+) -> pd.DataFrame:
     """Build the record-level manifest of everything the filter removes.
 
     Integrity rule 8 requires unusable records to be reported rather than
@@ -556,23 +718,26 @@ def supervised_exclusion_manifest(df: pd.DataFrame) -> pd.DataFrame:
 
     Args:
         df: Metadata frame from :func:`load_metadata`.
+        policy: Mapping of split to applicable reasons; defaults to
+            :data:`DEFAULT_EXCLUSION_POLICY`.
 
     Returns:
         One row per excluded record, indexed by ``ecg_id``, carrying the fold,
-        the labels it would have contributed, and a ``reasons`` string listing
-        every reason that applied.
+        the patient, the labels it would have contributed, and a ``reasons``
+        string listing every reason that applied.
     """
-    mask = supervised_exclusion_mask(df)
-    excluded = mask.index[mask["any"]]
-    reasons = mask.loc[excluded, list(SUPERVISED_EXCLUSION_REASONS)].apply(
+    reasons = supervised_drop_reasons(df, policy=policy)
+    excluded = reasons.index[reasons["any"]]
+    joined = reasons.loc[excluded, list(ALL_EXCLUSION_REASONS)].apply(
         lambda row: "+".join(name for name, hit in row.items() if hit), axis=1
     )
     return pd.DataFrame(
         {
             "strat_fold": df.loc[excluded, "strat_fold"],
             "split": df.loc[excluded, "split"],
+            "patient_id": df.loc[excluded, "patient_id"],
             "superclasses": df.loc[excluded, "superclasses"].apply(",".join),
-            "reasons": reasons,
+            "reasons": joined,
         }
     )
 
@@ -580,13 +745,16 @@ def supervised_exclusion_manifest(df: pd.DataFrame) -> pd.DataFrame:
 def apply_supervised_filter(
     df: pd.DataFrame,
     *,
-    splits: tuple[str, ...] = ("train",),
+    policy: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Remove records unfit for supervised training from the chosen splits.
+    """Build the supervised cohort by applying an exclusion policy.
 
-    By default the filter touches the training split only. Validation and test
-    are left whole, so the held-out metric keeps describing the population the
-    model will actually meet rather than a cleaner one.
+    Under the default policy the training split drops everything -- signal
+    quality, weak annotation, unusable labels and repeat patients -- while the
+    held-out folds drop only records whose labels cannot be scored at all. That
+    asymmetry is the point: cohort-shaping rules would make the held-out metric
+    describe a cleaner population than the real one, whereas an unlabelled or
+    self-contradictory record measures nothing about the model either way.
 
     This filter is for the **supervised** arms only. SSL pretraining uses every
     record in the training folds, filtered or not: it needs no labels, so
@@ -595,44 +763,56 @@ def apply_supervised_filter(
 
     Args:
         df: Metadata frame from :func:`load_metadata`.
-        splits: Which splits to apply the filter to.
+        policy: Mapping of split to applicable reasons; defaults to
+            :data:`DEFAULT_EXCLUSION_POLICY`.
 
     Returns:
         Tuple of ``(kept, manifest)``: the retained records, and the manifest of
-        what was removed, restricted to ``splits``.
+        what was removed.
     """
-    mask = supervised_exclusion_mask(df)
-    drop = mask["any"] & df["split"].isin(splits)
-    manifest = supervised_exclusion_manifest(df)
-    manifest = manifest[manifest["split"].isin(splits)]
-    return df[~drop].copy(), manifest
+    reasons = supervised_drop_reasons(df, policy=policy)
+    manifest = supervised_exclusion_manifest(df, policy=policy)
+    return df[~reasons["any"]].copy(), manifest
 
 
-def exclusion_summary(df: pd.DataFrame) -> pd.DataFrame:
+def exclusion_summary(
+    df: pd.DataFrame,
+    *,
+    policy: Mapping[str, Sequence[str]] | None = None,
+) -> pd.DataFrame:
     """Tabulate how many records each exclusion reason removes, per split.
 
-    Reasons overlap, so the per-reason columns do not sum to ``excluded_any``.
+    Counts reflect the policy: a reason a split's policy does not name removes
+    nothing there and is reported as 0. Reasons overlap, so the per-reason
+    columns do not sum to ``excluded_any``.
 
     Args:
         df: Metadata frame from :func:`load_metadata`.
+        policy: Mapping of split to applicable reasons; defaults to
+            :data:`DEFAULT_EXCLUSION_POLICY`.
 
     Returns:
-        DataFrame indexed by split with one column per reason, the combined
-        count, and the resulting retention percentage.
+        DataFrame indexed by split with the rules applied, one column per
+        reason, the combined count, and the resulting retention percentage.
     """
-    mask = supervised_exclusion_mask(df)
+    resolved = supervised_drop_reasons(df, policy=policy)
+    effective = DEFAULT_EXCLUSION_POLICY if policy is None else dict(policy)
+
     rows: list[pd.Series] = []
     for split in ("train", "val", "test"):
         selector = df["split"] == split
         total = int(selector.sum())
         if not total:
             continue
-        row = {"n_records": total}
-        for reason in SUPERVISED_EXCLUSION_REASONS:
-            row[reason] = int(mask.loc[selector, reason].sum())
-        row["excluded_any"] = int(mask.loc[selector, "any"].sum())
-        row["retained"] = total - row["excluded_any"]
-        row["retained_%"] = round(100.0 * row["retained"] / total, 2)
+        row: dict[str, object] = {
+            "n_records": total,
+            "n_rules": len(effective.get(split, ())),
+        }
+        for reason in ALL_EXCLUSION_REASONS:
+            row[reason] = int(resolved.loc[selector, reason].sum())
+        row["excluded_any"] = int(resolved.loc[selector, "any"].sum())
+        row["retained"] = total - int(row["excluded_any"])
+        row["retained_%"] = round(100.0 * int(row["retained"]) / total, 2)
         rows.append(pd.Series(row, name=split))
     return pd.DataFrame(rows).rename_axis("split")
 
