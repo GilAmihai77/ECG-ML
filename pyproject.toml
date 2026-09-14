@@ -32,6 +32,7 @@ dev = ["pytest>=7.4", "jupyter", "ipykernel", "nbformat"]
 
 [project.scripts]
 ecg-download = "ecg.data.download:main"
+ecg-preprocess = "ecg.data.preprocess:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
