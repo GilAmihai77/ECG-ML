@@ -11,24 +11,25 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 
 dependencies = [
+    # Kept deliberately small: this is what a cloud training run installs.
+    # Reading PTB-XL's WFDB files and plotting live in the extras below.
     "numpy>=1.26",
     "pandas>=2.0",
-    "scipy>=1.11",
-    "wfdb>=4.1",
-    "neurokit2>=0.2.7",
     "scikit-learn>=1.3",
-    "matplotlib>=3.8",
-    "seaborn>=0.13",
     "mlflow>=2.9",
     "tqdm>=4.66",
     "pyyaml>=6.0",
+    # torch>=2.6 is required, not merely preferred: earlier versions trip the
+    # CVE-2025-32434 torch.load check used by the HF model-loading path.
+    "torch>=2.6",
 ]
 
 [project.optional-dependencies]
-# torch>=2.6 is required, not merely preferred: earlier versions trip the
-# CVE-2025-32434 torch.load check used by the HF model-loading path.
-torch = ["torch>=2.6", "safetensors"]
-dev = ["pytest>=7.4", "jupyter", "ipykernel", "nbformat"]
+# Needed only to BUILD the waveform store from PTB-XL's WFDB files, and for the
+# R-peak analysis behind docs/. Training reads the store and never imports these.
+preprocess = ["wfdb>=4.1", "neurokit2>=0.2.7", "scipy>=1.11"]
+notebooks = ["matplotlib>=3.8", "seaborn>=0.13", "jupyter", "ipykernel", "nbformat"]
+dev = ["pytest>=7.4"]
 
 [project.scripts]
 ecg-download = "ecg.data.download:main"
