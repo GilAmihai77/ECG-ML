@@ -144,9 +144,20 @@ code(
 !git clone --depth 1 {REPO} /content/ECG-ML 2>/dev/null || (cd /content/ECG-ML && git pull -q)
 %pip install -q -e /content/ECG-ML
 
+# The editable install writes a .pth file into site-packages, but `site` only
+# reads .pth files when the interpreter starts, so it does not affect the kernel
+# that just ran the install. Point at src/ by hand instead of restarting.
+# Subprocesses (the ecg-run console script) start fresh and need none of this.
+import importlib
+import sys
+
+if "/content/ECG-ML/src" not in sys.path:
+    sys.path.insert(0, "/content/ECG-ML/src")
+importlib.invalidate_caches()
+
 import ecg
 
-print("ecg", ecg.__version__)
+print("ecg", ecg.__version__, "from", ecg.__file__)
 """
 )
 
