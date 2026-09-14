@@ -21,6 +21,26 @@ Because the cloud target is Colab/RunPod, whose filesystems are ephemeral:
 
 If possible I want all experiments tracked by mlflow.
 
+Tracking and durability, as built:
+- MLflow uses the SQLite backend on LOCAL disk. MLflow 3.x raises on the old
+  file store unless MLFLOW_ALLOW_FILE_STORE=true, and the file store was the
+  wrong shape anyway - it writes one small file per metric, and Drive has no
+  partial update, so every append re-uploads a whole file.
+- Never put the SQLite file itself on Drive. SQLite locking assumes POSIX
+  semantics that FUSE does not honour.
+- Each epoch makes exactly two durable writes, both to the Drive output dir:
+  the checkpoint and a consistent copy of mlflow.db taken through sqlite3's
+  backup API. Log per epoch, never per step.
+- Every mlflow call and every checkpoint write is wrapped. Instrumentation must
+  never cost an A100 hour.
+
+Running the study:
+  ecg-run --dry-run                 # print the 14-run grid, book no GPU
+  ecg-run --plan ablation           # pick the mask ratio first, on val
+  ecg-run --output /content/drive/MyDrive/ecg/runs
+Resuming is the default: a finished run writes result.json and is skipped, so a
+Colab disconnect costs one run rather than the study.
+
 Goal of reseach:
 Does self-supervised pretraining help when labelled ECG data is scarce,
 and does the patch embedding choice interact with it?
