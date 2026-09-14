@@ -159,6 +159,39 @@ def nested_subsets(
     return subsets
 
 
+def holdout_split(
+    cohort: Cohort, fraction: float, *, seed: int = 0
+) -> tuple[Cohort, Cohort]:
+    """Split a cohort into a larger part and a held-out part.
+
+    Used to carve a reconstruction-validation slice out of the SSL pool. The
+    slice is taken from the pool itself rather than from the supervised
+    validation split, so pretraining never observes a cohort that is later used
+    for model selection -- pretraining and fine-tuning would otherwise share an
+    early-stopping signal.
+
+    Args:
+        cohort: Cohort to split.
+        fraction: Fraction held out, in ``[0, 1)``.
+        seed: Seed for the permutation (integrity rule 4).
+
+    Returns:
+        ``(kept, held_out)``. ``held_out`` is empty when ``fraction`` is zero.
+
+    Raises:
+        ValueError: If ``fraction`` is outside ``[0, 1)``.
+    """
+    if not 0.0 <= fraction < 1.0:
+        raise ValueError(f"fraction must be in [0, 1), got {fraction}")
+
+    order = np.random.default_rng(seed).permutation(len(cohort))
+    n_held = int(round(len(cohort) * fraction))
+    return (
+        cohort.subset(order[n_held:], name=f"{cohort.name}-train"),
+        cohort.subset(order[:n_held], name=f"{cohort.name}-holdout"),
+    )
+
+
 def assert_patient_disjoint(
     cohorts: dict[str, Cohort], metadata: pd.DataFrame, *, splits: Sequence[str] = ("train", "val", "test")
 ) -> None:
