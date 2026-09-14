@@ -511,32 +511,82 @@ ALL_EXCLUSION_REASONS: tuple[str, ...] = (*SUPERVISED_EXCLUSION_REASONS, DUPLICA
 
 #: Reasons the label itself cannot be scored against a 5-class target: the
 #: record has no superclass at all, or asserts NORM together with a pathology.
-#: These apply to **every** split, held-out folds included. Keeping such records
-#: in val or test would not make the evaluation more realistic -- an unlabelled
-#: record scores as all-negative and a contradictory one is unwinnable by
-#: construction, so they impose an arbitrary ceiling rather than measuring
-#: anything about the model.
+#: Keeping such records in val or test would not make the evaluation more
+#: realistic -- an unlabelled record scores as all-negative and a contradictory
+#: one is unwinnable by construction, so they impose an arbitrary ceiling rather
+#: than measuring anything about the model.
 LABEL_VALIDITY_REASONS: tuple[str, ...] = ("unlabelled", "norm_with_pathology")
 
-#: Reasons that shape the training cohort rather than establish label validity:
-#: signal quality, annotation strength, and one-record-per-patient weighting.
-#: These apply to the training split only. Applying them to val or test would
-#: make the held-out metric describe a cleaner population than the real one.
+#: Reasons that define *which population the study is about* rather than
+#: describe label quality. Pacing replaces the heart's own rhythm: RR intervals
+#: become artificially regular and QRS morphology is set by the device, so a
+#: paced tracing is a different kind of input, not a noisier version of the same
+#: one. Excluding it from training but scoring on it would test both tokenizers
+#: on a morphology neither was trained for, and would do so unequally -- the RR
+#: tokenizer is the one whose token boundaries pacing changes.
+POPULATION_REASONS: tuple[str, ...] = ("pacemaker",)
+
+#: Reasons applied to **every** split, held-out folds included. The study is
+#: about scoring non-paced tracings against a valid 5-class label.
+ALL_SPLIT_REASONS: tuple[str, ...] = (*LABEL_VALIDITY_REASONS, *POPULATION_REASONS)
+
+#: Reasons that shape the training cohort rather than define the population or
+#: establish label validity: electrode faults, annotation strength, and
+#: one-record-per-patient weighting. These apply to the training split only.
+#: Applying them to val or test would make the held-out metric describe a
+#: cleaner population than the real one.
 COHORT_QUALITY_REASONS: tuple[str, ...] = (
-    "pacemaker",
     "electrodes_problems",
     "not_validated_by_human",
     DUPLICATE_REASON,
 )
 
 #: Which exclusion reasons apply to which split. The asymmetry is deliberate:
-#: training drops everything, while the held-out folds drop only records whose
-#: labels cannot be scored at all.
+#: training drops everything, while the held-out folds drop only records outside
+#: the study population or without a scorable label.
 DEFAULT_EXCLUSION_POLICY: dict[str, tuple[str, ...]] = {
     "train": ALL_EXCLUSION_REASONS,
-    "val": LABEL_VALIDITY_REASONS,
-    "test": LABEL_VALIDITY_REASONS,
+    "val": ALL_SPLIT_REASONS,
+    "test": ALL_SPLIT_REASONS,
 }
+
+
+#: SCP statements asserting a paced rhythm. PTB-XL records pacing twice and
+#: inconsistently: in the free-text ``pacemaker`` metadata column and as this
+#: statement. The two sets are not nested -- each contains records the other
+#: misses -- so the rule takes their union.
+PACING_SCP_CODES: frozenset[str] = frozenset({"PACE"})
+
+
+def pacing_mask(df: pd.DataFrame) -> pd.Series:
+    """Flag paced records from either place PTB-XL records pacing.
+
+    The ``pacemaker`` metadata column (291 records) and the ``PACE`` SCP
+    statement (294) disagree on 15 records in PTB-XL v1.0.3, in both directions.
+    Keying off one alone therefore lets paced tracings through, so both are
+    consulted and the union is taken.
+
+    Statement presence is enough: a likelihood of ``0.0`` in ``scp_codes`` means
+    "asserted, confidence unquantified", so no threshold is applied here -- the
+    same convention :func:`assign_superclasses` documents.
+
+    Args:
+        df: Metadata frame from :func:`load_metadata`. Falls back to parsing the
+            raw ``scp_codes`` column when ``scp_codes_parsed`` is absent.
+
+    Returns:
+        Boolean Series indexed like ``df``, ``True`` where the record is paced.
+    """
+    column = df["pacemaker"]
+    from_metadata = column.notna() & (column.astype(str).str.strip() != "")
+
+    if "scp_codes_parsed" in df.columns:
+        parsed = df["scp_codes_parsed"]
+    else:
+        parsed = df["scp_codes"].apply(parse_scp_codes)
+    from_statement = parsed.apply(lambda codes: not PACING_SCP_CODES.isdisjoint(codes))
+
+    return from_metadata | from_statement
 
 
 def supervised_exclusion_mask(df: pd.DataFrame) -> pd.DataFrame:
@@ -548,7 +598,8 @@ def supervised_exclusion_mask(df: pd.DataFrame) -> pd.DataFrame:
 
     * ``pacemaker`` -- paced rhythms have artificially regular RR intervals and
       atypical QRS morphology, making them unrepresentative input for a beat
-      tokenizer.
+      tokenizer. Detected from the metadata column *or* the ``PACE`` statement;
+      see :func:`pacing_mask`.
     * ``electrodes_problems`` -- the recording itself is suspect.
     * ``not_validated_by_human`` -- the label was never checked by a
       cardiologist, so it is weak supervision.
@@ -576,7 +627,7 @@ def supervised_exclusion_mask(df: pd.DataFrame) -> pd.DataFrame:
         return values.notna() & (values.astype(str).str.strip() != "")
 
     mask = pd.DataFrame(index=df.index)
-    mask["pacemaker"] = flagged("pacemaker")
+    mask["pacemaker"] = pacing_mask(df)
     mask["electrodes_problems"] = flagged("electrodes_problems")
     mask["not_validated_by_human"] = ~_as_bool(df["validated_by_human"])
     mask["unlabelled"] = df["n_superclasses"] == 0
@@ -751,10 +802,11 @@ def apply_supervised_filter(
 
     Under the default policy the training split drops everything -- signal
     quality, weak annotation, unusable labels and repeat patients -- while the
-    held-out folds drop only records whose labels cannot be scored at all. That
-    asymmetry is the point: cohort-shaping rules would make the held-out metric
-    describe a cleaner population than the real one, whereas an unlabelled or
-    self-contradictory record measures nothing about the model either way.
+    held-out folds drop only records outside the study population (paced) or
+    without a scorable label. That asymmetry is the point: cohort-shaping rules
+    would make the held-out metric describe a cleaner population than the real
+    one, whereas a paced, unlabelled or self-contradictory record measures
+    nothing about the model either way.
 
     This filter is for the **supervised** arms only. SSL pretraining uses every
     record in the training folds, filtered or not: it needs no labels, so

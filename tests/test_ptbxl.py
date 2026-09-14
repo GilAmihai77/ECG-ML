@@ -15,8 +15,10 @@ import pytest
 from ecg.data.ptbxl import (
     AGE_SENTINEL,
     ALL_EXCLUSION_REASONS,
+    ALL_SPLIT_REASONS,
     DEFAULT_EXCLUSION_POLICY,
     LABEL_VALIDITY_REASONS,
+    POPULATION_REASONS,
     SUPERCLASSES,
     SUPERVISED_EXCLUSION_REASONS,
     TEST_FOLD,
@@ -31,6 +33,7 @@ from ecg.data.ptbxl import (
     fold_summary,
     label_matrix,
     load_metadata,
+    pacing_mask,
     parse_scp_codes,
     provenance_by_fold,
     quality_flag_summary,
@@ -53,6 +56,7 @@ LAFB,1.0,CD,LAFB/LPFB
 LVH,1.0,HYP,LVH
 SR,0.0,,
 AFIB,0.0,,
+PACE,0.0,,
 """
 
 # Row 5 is deliberately unlabelled (only non-diagnostic statements) to exercise
@@ -306,6 +310,44 @@ class TestSupervisedFilter:
         assert bool(mask.loc[4, "pacemaker"]) is True
         assert bool(mask.loc[4, "any"]) is True
 
+    def test_pacemaker_detected_from_scp_statement(self, metadata: pd.DataFrame) -> None:
+        """PACE in scp_codes counts even with an empty pacemaker column.
+
+        The two fields disagree on 15 records in the real dataset, so keying off
+        the metadata column alone lets paced tracings through.
+        """
+        df = metadata.copy()
+        df.at[4, "scp_codes_parsed"] = {"ASMI": 100.0, "PACE": 0.0}
+        mask = supervised_exclusion_mask(df)
+        assert df["pacemaker"].isna().all()
+        assert bool(mask.loc[4, "pacemaker"]) is True
+
+    def test_pacing_likelihood_zero_still_counts(self, metadata: pd.DataFrame) -> None:
+        """0.0 means 'asserted, confidence unquantified', not 'absent'."""
+        df = metadata.copy()
+        df.at[2, "scp_codes_parsed"] = {"IMI": 80.0, "PACE": 0.0}
+        assert bool(pacing_mask(df).loc[2]) is True
+
+    def test_pacing_mask_takes_the_union_of_both_sources(
+        self, metadata: pd.DataFrame
+    ) -> None:
+        df = metadata.copy()
+        df["pacemaker"] = df["pacemaker"].astype(object)
+        df.loc[1, "pacemaker"] = "ja, pacemaker"  # column only
+        df.at[2, "scp_codes_parsed"] = {"IMI": 80.0, "PACE": 0.0}  # statement only
+        flags = pacing_mask(df)
+        assert bool(flags.loc[1]) is True
+        assert bool(flags.loc[2]) is True
+        assert bool(flags.loc[4]) is False
+
+    def test_pacing_mask_parses_raw_scp_codes_when_needed(
+        self, metadata: pd.DataFrame
+    ) -> None:
+        """Works on a frame that has not been through load_metadata."""
+        df = metadata.drop(columns=["scp_codes_parsed"])
+        df.loc[4, "scp_codes"] = "{'ASMI': 100.0, 'PACE': 0.0}"
+        assert bool(pacing_mask(df).loc[4]) is True
+
     def test_reasons_can_overlap(self, metadata: pd.DataFrame) -> None:
         df = metadata.copy()
         df["pacemaker"] = df["pacemaker"].astype(object)
@@ -524,20 +566,40 @@ class TestDefaultPolicy:
         kept, _ = apply_supervised_filter(df)
         assert {4, 5} <= set(kept.index)
 
+    def test_paced_records_are_excluded_from_every_split(
+        self, metadata: pd.DataFrame
+    ) -> None:
+        """Pacing defines the study population, so it applies to val and test too."""
+        df = metadata.copy()
+        df["pacemaker"] = df["pacemaker"].astype(object)
+        df.loc[3, "pacemaker"] = "ja, pacemaker"  # val
+        df.at[4, "scp_codes_parsed"] = {"ASMI": 100.0, "PACE": 0.0}  # test
+        kept, manifest = apply_supervised_filter(df)
+        assert 3 not in kept.index
+        assert 4 not in kept.index
+        assert manifest.loc[4, "reasons"] == "pacemaker"
+
     def test_policy_covers_every_split(self) -> None:
         assert set(DEFAULT_EXCLUSION_POLICY) == {"train", "val", "test"}
         assert DEFAULT_EXCLUSION_POLICY["train"] == ALL_EXCLUSION_REASONS
-        assert DEFAULT_EXCLUSION_POLICY["val"] == LABEL_VALIDITY_REASONS
-        assert DEFAULT_EXCLUSION_POLICY["test"] == LABEL_VALIDITY_REASONS
+        assert DEFAULT_EXCLUSION_POLICY["val"] == ALL_SPLIT_REASONS
+        assert DEFAULT_EXCLUSION_POLICY["test"] == ALL_SPLIT_REASONS
 
-    def test_label_and_cohort_reasons_partition_all_reasons(self) -> None:
+    def test_reason_groups_partition_all_reasons(self) -> None:
         """Every reason is classified exactly once, so none can be forgotten."""
         from ecg.data.ptbxl import COHORT_QUALITY_REASONS
 
-        assert set(LABEL_VALIDITY_REASONS) | set(COHORT_QUALITY_REASONS) == set(
-            ALL_EXCLUSION_REASONS
+        groups = (LABEL_VALIDITY_REASONS, POPULATION_REASONS, COHORT_QUALITY_REASONS)
+        union: set[str] = set()
+        for group in groups:
+            assert not union & set(group), "a reason is classified twice"
+            union |= set(group)
+        assert union == set(ALL_EXCLUSION_REASONS)
+
+    def test_all_split_reasons_is_the_held_out_rule_set(self) -> None:
+        assert set(ALL_SPLIT_REASONS) == set(LABEL_VALIDITY_REASONS) | set(
+            POPULATION_REASONS
         )
-        assert not set(LABEL_VALIDITY_REASONS) & set(COHORT_QUALITY_REASONS)
 
     def test_unknown_reason_is_rejected(self, metadata: pd.DataFrame) -> None:
         """A typo in a config must fail loudly, not silently skip a rule."""
@@ -551,7 +613,7 @@ class TestDefaultPolicy:
     def test_summary_reports_rule_counts_per_split(self, metadata: pd.DataFrame) -> None:
         summary = exclusion_summary(metadata)
         assert summary.loc["train", "n_rules"] == len(ALL_EXCLUSION_REASONS)
-        assert summary.loc["val", "n_rules"] == len(LABEL_VALIDITY_REASONS)
+        assert summary.loc["val", "n_rules"] == len(ALL_SPLIT_REASONS)
         # A cohort-quality rule removes nothing from a held-out split.
         assert summary.loc["val", "electrodes_problems"] == 0
         assert summary.loc["test", "duplicate_patient_record"] == 0
