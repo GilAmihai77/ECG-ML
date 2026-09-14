@@ -49,6 +49,14 @@ are already inside the store; only the two CSVs are read at training time.
 Upload the store as a **folder**, not as a zip you unpack on Drive — unzipping
 onto a FUSE mount is far slower than uploading the two `.npy` files directly.
 
+**3. Cell 4 copies the data to `/content`.** Drive holds the master copy;
+training reads the local one. This is not premature optimisation: the store is
+*memory-mapped*, so reading it from Drive turns every page fault into a network
+round-trip, and a mount that goes stale mid-run surfaces as a SIGBUS inside
+numpy rather than a catchable error. You pay the same 500 MB read either way —
+copying makes it one bulk sequential read, which is what Drive is fastest at,
+and every later `ecg-run` in the session reads from local disk instead.
+
 ## The order to run in
 
 1. **Cells 1-4** — setup and checks. Fast.
@@ -112,13 +120,20 @@ drive.mount("/content/drive")
 
 from pathlib import Path
 
+# Drive holds the master data and receives every checkpoint.
 ECG = Path("/content/drive/MyDrive/ecg")
-STORE = ECG / "store_100hz"
-METADATA = ECG / "ptbxl"
+DRIVE_STORE = ECG / "store_100hz"
+DRIVE_METADATA = ECG / "ptbxl"
 RUNS = ECG / "runs"
 RUNS.mkdir(parents=True, exist_ok=True)
 
-print(f"workspace: {ECG}")
+# Training reads from local disk. See cell 4.
+LOCAL = Path("/content/data")
+STORE = LOCAL / "store_100hz"
+METADATA = LOCAL / "ptbxl"
+
+print(f"drive:  {ECG}")
+print(f"local:  {LOCAL}")
 """
 )
 
@@ -137,11 +152,37 @@ print("ecg", ecg.__version__)
 
 md(
     """
-## 4. Check the data arrived
+## 4. Copy the data to local disk, then check it
 
-This reads the store's header and the two CSVs, and prints the cohort sizes. If
-the numbers below do not match what you saw locally, stop here -- a truncated
-Drive upload is much cheaper to find now than after an hour of pretraining.
+The store is memory-mapped, so leaving it on Drive would turn page faults into
+network round-trips during training and make a stale mount a SIGBUS inside
+numpy. Copy once, ~30-60 s, then everything reads locally at SSD speed.
+
+The check afterwards prints the cohort sizes. If they do not match what you saw
+locally, stop -- a truncated upload is much cheaper to find now than an hour
+into pretraining.
+"""
+)
+
+code(
+    """
+import shutil
+import time
+
+for source, destination in ((DRIVE_STORE, STORE), (DRIVE_METADATA, METADATA)):
+    assert source.exists(), f"missing on Drive: {source}"
+    if destination.exists():
+        print(f"{destination} already present, skipping copy")
+        continue
+    start = time.perf_counter()
+    shutil.copytree(source, destination)
+    size = sum(f.stat().st_size for f in destination.rglob("*") if f.is_file())
+    print(
+        f"copied {source.name}: {size / 1e6:.0f} MB in "
+        f"{time.perf_counter() - start:.0f} s"
+    )
+
+!df -h /content | tail -1
 """
 )
 
@@ -152,7 +193,7 @@ from ecg.data.preprocess import WaveformStore
 from ecg.data.ptbxl import load_metadata
 
 for required in (STORE / "waveforms.npy", METADATA / "ptbxl_database.csv"):
-    assert required.exists(), f"missing on Drive: {required}"
+    assert required.exists(), f"missing locally: {required}"
 
 store = WaveformStore.load(STORE)
 metadata = load_metadata(METADATA)

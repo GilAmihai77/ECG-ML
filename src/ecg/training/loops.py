@@ -247,7 +247,8 @@ def pretrain(
             result.best_score = score
             result.best_epoch = epoch
             result.best_checkpoint = _persist(
-                output / "pretrain_best.pt", epoch, model, optimiser, config, record
+                output / "pretrain_best.pt", epoch, model, optimiser, config,
+                record, with_optimiser=False,
             )
         _persist(output / "pretrain_last.pt", epoch, model, optimiser, config, record)
 
@@ -329,7 +330,8 @@ def train_supervised(
             result.best_epoch = epoch
             stale = 0
             result.best_checkpoint = _persist(
-                output / "best.pt", epoch, model, optimiser, config, record
+                output / "best.pt", epoch, model, optimiser, config, record,
+                with_optimiser=False,
             )
         else:
             stale += 1
@@ -411,6 +413,8 @@ def _persist(
     optimiser: torch.optim.Optimizer,
     config: RunConfig,
     metrics: dict[str, float],
+    *,
+    with_optimiser: bool = True,
 ) -> Path | None:
     """Write a checkpoint and copy the tracking database beside it.
 
@@ -425,6 +429,12 @@ def _persist(
         optimiser: Optimiser to save.
         config: The run configuration.
         metrics: Metrics at this epoch.
+        with_optimiser: Include optimiser state. ``True`` for the ``last``
+            checkpoint, which exists to resume from. ``False`` for ``best``,
+            which is only ever read for its weights -- by
+            :func:`~ecg.training.checkpoints.load_encoder_weights` and by the
+            test evaluation -- so the optimiser state would be two thirds of a
+            40 MB Drive write for nothing.
 
     Returns:
         The checkpoint path, or ``None`` if the write failed.
@@ -434,7 +444,7 @@ def _persist(
             path,
             epoch=epoch,
             model=model,
-            optimiser=optimiser,
+            optimiser=optimiser if with_optimiser else None,
             config=config,
             metrics=metrics,
         )

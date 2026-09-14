@@ -122,6 +122,21 @@ class TestSupervisedLoop:
             assert "train_loss" in record
             assert "lr" in record
 
+    def test_best_checkpoint_carries_no_optimiser_state(self, learnable, config) -> None:
+        """best.pt is read only for its weights, by encoder transfer and by the
+        test evaluation. Optimiser state would be two thirds of a 40 MB Drive
+        write per improving epoch, for nothing."""
+        store, cohort = learnable
+        result = train_supervised(
+            build_classifier(config.model),
+            EcgBatches(store, cohort, batch_size=16, seed=0),
+            EcgBatches(store, cohort, batch_size=16, shuffle=False),
+            config,
+            progress=False,
+        )
+        assert load_checkpoint(result.best_checkpoint)["optimiser"] is None
+        assert load_checkpoint(Path(config.output_dir) / "last.pt")["optimiser"] is not None
+
     def test_checkpoint_is_self_describing(self, learnable, config) -> None:
         """Integrity rule 5."""
         store, cohort = learnable
