@@ -13,7 +13,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
+import ecg.experiments.runner as runner
 from ecg.data.datasets import Cohort
 from ecg.data.preprocess import LEADS, SCALE, WaveformStore
 from ecg.data.ptbxl import SUPERCLASSES
@@ -36,6 +38,7 @@ from ecg.experiments.runner import (
     run_plan,
     ssl_benefit,
 )
+from ecg.training.loops import resolve_device
 from ecg.models.config import ModelConfig, SslConfig
 from ecg.training.config import RunConfig, TrainConfig
 
@@ -256,6 +259,40 @@ class TestRunner:
         )
         assert Path(outcome.checkpoint).name == "best.pt"
         assert outcome.best_epoch <= outcome.epochs_run
+
+
+class TestDevicePlacement:
+    """The loops move the *model* with ``.to(device)`` and never touch the
+    batches, so a cohort built without a device is invisible on a CPU-only box
+    and dies on the first matmul of a GPU run. Local torch here is CPU-only, so
+    these check placement rather than run on a GPU."""
+
+    def test_batches_land_on_the_device_they_are_given(self, base, workspace) -> None:
+        batches = runner._batches(
+            workspace, workspace.cohorts["val"], base, torch.device("meta"), shuffle=False
+        )
+        assert batches.waveforms.device.type == "meta"
+        assert batches.labels.device.type == "meta"
+
+    def test_every_cohort_in_a_run_is_placed_explicitly(
+        self, base, workspace, tmp_path, monkeypatch
+    ) -> None:
+        seen: list[object] = []
+        original = runner.EcgBatches
+
+        def recording(*args, **kwargs):
+            seen.append(kwargs.get("device", "MISSING"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(runner, "EcgBatches", recording)
+        specs = experiment_plan(base, fractions=(1.0,), embedders=("linear",))
+        run_plan(
+            specs, workspace, output_root=tmp_path / "runs", track=False, progress=False
+        )
+
+        expected = resolve_device(base.train.device)
+        assert len(seen) >= 5, "expected ssl train/holdout plus train/val/test"
+        assert all(device == expected for device in seen), seen
 
 
 class TestResults:

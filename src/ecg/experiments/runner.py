@@ -23,6 +23,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import torch
 
 from ecg.data.datasets import Cohort, EcgBatches, build_cohorts, holdout_split, nested_subsets
 from ecg.data.preprocess import WaveformStore
@@ -31,7 +32,7 @@ from ecg.models.encoder import build_classifier
 from ecg.models.ssl import build_pretrainer
 from ecg.training.checkpoints import load_encoder_weights
 from ecg.training.config import RunConfig
-from ecg.training.loops import evaluate_classifier, pretrain, train_supervised
+from ecg.training.loops import evaluate_classifier, pretrain, resolve_device, train_supervised
 from ecg.training.metrics import ClassificationMetrics
 from ecg.training.tracking import Tracker
 from ecg.experiments.plan import RunSpec
@@ -340,6 +341,42 @@ def ssl_benefit(
     return pivot
 
 
+def _batches(
+    workspace: Workspace,
+    cohort: Cohort,
+    config: RunConfig,
+    device: torch.device,
+    *,
+    shuffle: bool,
+) -> EcgBatches:
+    """Build batches resident on the training device.
+
+    Every cohort goes through here rather than constructing :class:`EcgBatches`
+    inline, because the device is easy to omit and omitting it fails only on a
+    GPU: the model is moved by the training loop, the batches are not, and the
+    first matmul reports a device mismatch several frames deep.
+
+    Args:
+        workspace: Shared store and cohorts.
+        cohort: Records to iterate.
+        config: The run configuration, supplying batch size and seed.
+        device: Device the model will train on.
+        shuffle: Shuffle each epoch. ``False`` for evaluation cohorts, so
+            predictions line up with :attr:`Cohort.ecg_ids`.
+
+    Returns:
+        Batches whose tensors already live on ``device``.
+    """
+    return EcgBatches(
+        workspace.store,
+        cohort,
+        batch_size=config.train.batch_size,
+        shuffle=shuffle,
+        device=device,
+        seed=config.train.seed,
+    )
+
+
 def _run_pretrain(
     spec: RunSpec,
     config: RunConfig,
@@ -351,17 +388,12 @@ def _run_pretrain(
     pool = workspace.cohorts["ssl"]
     kept, held = holdout_split(pool, config.ssl_holdout, seed=config.subset_seed)
     model = build_pretrainer(config.model, config.ssl)
+    device = resolve_device(config.train.device)
 
     result = pretrain(
         model,
-        EcgBatches(
-            workspace.store, kept, batch_size=config.train.batch_size,
-            device=config.train.device if config.train.device != "auto" else "cpu",
-            seed=config.train.seed,
-        ),
-        EcgBatches(workspace.store, held, batch_size=config.train.batch_size, shuffle=False)
-        if len(held)
-        else None,
+        _batches(workspace, kept, config, device, shuffle=True),
+        _batches(workspace, held, config, device, shuffle=False) if len(held) else None,
         config,
         tracker=tracker,
         progress=progress,
@@ -407,17 +439,12 @@ def _run_supervised(
     model = build_classifier(config.model)
     if config.pretrained_from:
         load_encoder_weights(model, config.pretrained_from)
+    device = resolve_device(config.train.device)
 
-    val_batches = EcgBatches(
-        workspace.store, workspace.cohorts["val"],
-        batch_size=config.train.batch_size, shuffle=False,
-    )
+    val_batches = _batches(workspace, workspace.cohorts["val"], config, device, shuffle=False)
     result = train_supervised(
         model,
-        EcgBatches(
-            workspace.store, train_cohort, batch_size=config.train.batch_size,
-            seed=config.train.seed,
-        ),
+        _batches(workspace, train_cohort, config, device, shuffle=True),
         val_batches,
         config,
         tracker=tracker,
@@ -434,7 +461,7 @@ def _run_supervised(
         selected.load_state_dict(load_checkpoint(result.best_checkpoint)["model"])
     else:
         selected.load_state_dict(model.state_dict())
-    selected.to(next(model.parameters()).device)
+    selected.to(device)
 
     val_metrics = evaluate_classifier(selected, val_batches)
     thresholds = np.array(
@@ -442,10 +469,7 @@ def _run_supervised(
     )
     test_metrics = evaluate_classifier(
         selected,
-        EcgBatches(
-            workspace.store, workspace.cohorts["test"],
-            batch_size=config.train.batch_size, shuffle=False,
-        ),
+        _batches(workspace, workspace.cohorts["test"], config, device, shuffle=False),
         thresholds,
     )
 
