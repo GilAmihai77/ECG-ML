@@ -297,6 +297,42 @@ class TestSupervisedFilter:
         manifest = supervised_exclusion_manifest(df)
         assert manifest.loc[1, "reasons"] == "pacemaker+not_validated_by_human"
 
+    def test_unlabelled_records_are_excluded(self, metadata: pd.DataFrame) -> None:
+        """Row 5 carries only rhythm statements, so it has no training signal."""
+        mask = supervised_exclusion_mask(metadata)
+        assert bool(mask.loc[5, "unlabelled"]) is True
+        assert bool(mask.loc[1, "unlabelled"]) is False
+
+    def test_norm_with_pathology_is_excluded(self, metadata: pd.DataFrame) -> None:
+        """NORM plus a pathology is self-contradictory: one label must be wrong."""
+        df = metadata.copy()
+        df.loc[1, "MI"] = True  # row 1 is NORM; now it is NORM+MI
+        mask = supervised_exclusion_mask(df)
+        assert bool(mask.loc[1, "norm_with_pathology"]) is True
+        assert bool(mask.loc[1, "any"]) is True
+
+    def test_norm_alone_is_kept(self, metadata: pd.DataFrame) -> None:
+        mask = supervised_exclusion_mask(metadata)
+        assert bool(mask.loc[1, "norm_with_pathology"]) is False
+
+    def test_multiple_pathologies_without_norm_are_kept(
+        self, metadata: pd.DataFrame
+    ) -> None:
+        """Co-occurring pathologies are ordinary multi-label, not a conflict."""
+        mask = supervised_exclusion_mask(metadata)
+        assert metadata.loc[2, "superclasses"] == ["MI", "HYP"]
+        assert bool(mask.loc[2, "norm_with_pathology"]) is False
+        assert bool(mask.loc[2, "any"]) is False
+
+    def test_every_pathology_class_triggers_the_conflict(
+        self, metadata: pd.DataFrame
+    ) -> None:
+        for pathology in ("MI", "STTC", "CD", "HYP"):
+            df = metadata.copy()
+            df.loc[1, pathology] = True
+            mask = supervised_exclusion_mask(df)
+            assert bool(mask.loc[1, "norm_with_pathology"]) is True, pathology
+
     def test_filter_touches_only_requested_splits(self, metadata: pd.DataFrame) -> None:
         """Val and test must stay whole by default."""
         kept, _ = apply_supervised_filter(metadata, splits=("train",))

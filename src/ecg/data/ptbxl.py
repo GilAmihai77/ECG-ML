@@ -487,20 +487,26 @@ def quality_flag_summary(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).rename_axis("quality_flag")
 
 
+#: The four pathological superclasses -- every class except ``NORM``.
+PATHOLOGY_CLASSES: tuple[str, ...] = tuple(c for c in SUPERCLASSES if c != "NORM")
+
 #: Reasons a record is withheld from the *supervised* training set. Order is
 #: fixed so manifests and reports stay comparable across runs.
 SUPERVISED_EXCLUSION_REASONS: tuple[str, ...] = (
     "pacemaker",
     "electrodes_problems",
     "not_validated_by_human",
+    "unlabelled",
+    "norm_with_pathology",
 )
 
 
 def supervised_exclusion_mask(df: pd.DataFrame) -> pd.DataFrame:
     """Flag, per record, each reason it is unfit for supervised training.
 
-    Three independent concerns, deliberately kept separate rather than collapsed
-    into a single boolean:
+    Five independent concerns, deliberately kept separate rather than collapsed
+    into a single boolean -- two about the signal, one about the annotator, two
+    about the label itself:
 
     * ``pacemaker`` -- paced rhythms have artificially regular RR intervals and
       atypical QRS morphology, making them unrepresentative input for a beat
@@ -508,6 +514,12 @@ def supervised_exclusion_mask(df: pd.DataFrame) -> pd.DataFrame:
     * ``electrodes_problems`` -- the recording itself is suspect.
     * ``not_validated_by_human`` -- the label was never checked by a
       cardiologist, so it is weak supervision.
+    * ``unlabelled`` -- no diagnostic superclass at all, so the record carries
+      no training signal for a 5-class target.
+    * ``norm_with_pathology`` -- annotated ``NORM`` *and* at least one
+      pathology. The two assertions contradict each other: a tracing cannot be
+      normal and abnormal at once, so one of the labels is wrong and there is no
+      way to tell which.
 
     A record may trip more than one reason; the columns are not mutually
     exclusive.
@@ -529,6 +541,8 @@ def supervised_exclusion_mask(df: pd.DataFrame) -> pd.DataFrame:
     mask["pacemaker"] = flagged("pacemaker")
     mask["electrodes_problems"] = flagged("electrodes_problems")
     mask["not_validated_by_human"] = ~_as_bool(df["validated_by_human"])
+    mask["unlabelled"] = df["n_superclasses"] == 0
+    mask["norm_with_pathology"] = df["NORM"] & df[list(PATHOLOGY_CLASSES)].any(axis=1)
     mask["any"] = mask[list(SUPERVISED_EXCLUSION_REASONS)].any(axis=1)
     return mask
 
@@ -575,8 +589,9 @@ def apply_supervised_filter(
     model will actually meet rather than a cleaner one.
 
     This filter is for the **supervised** arms only. SSL pretraining uses every
-    record in the training folds, filtered or not, because it needs no labels.
-    Folds 9 and 10 are excluded from pretraining entirely.
+    record in the training folds, filtered or not: it needs no labels, so
+    unlabelled and self-contradictory annotations are irrelevant to it. Folds 9
+    and 10 are excluded from pretraining entirely.
 
     Args:
         df: Metadata frame from :func:`load_metadata`.
