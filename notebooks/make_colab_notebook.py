@@ -1,7 +1,16 @@
-"""Generate the Colab runner notebook."""
+"""Generate the Colab runner notebook.
+
+**This script is a scaffold, not the source of truth.** The notebook it writes
+has since been edited directly -- the research summary in section 12 exists
+only there -- so regenerating would delete that work. The guard below refuses
+to overwrite a notebook that has grown more cells than this script produces.
+Edit the notebook, not this file, unless you are rebuilding it from scratch.
+"""
 
 from __future__ import annotations
 
+import json
+import sys
 from pathlib import Path
 
 import nbformat as nbf
@@ -328,32 +337,78 @@ Fourteen runs: two pretraining runs, then four arms at each of three label
 fractions. **Set `MASK_RATIO` to whatever cell 7 selected.**
 
 Safe to re-run after a disconnect -- finished runs are skipped.
+
+### `VARIANT`: set this whenever you change the model
+
+A run name says which embedder and which label fraction — nothing about the
+architecture. A run name is also its output directory, and finished directories
+are skipped. So if you change the transformer and re-run with the same
+`VARIANT`, **all fourteen runs are skipped and you get the old architecture's
+numbers back**, labelled as the new one's.
+
+`--variant` prefixes every run name, which gives the new architecture its own
+directories and its own rows in MLflow. Name what changed, in a slug with no
+spaces:
+
+| you changed | `VARIANT` |
+|---|---|
+| nothing yet, the first study | `base` |
+| 4 layers -> 6 | `deep6` |
+| one more conv layer in the stem | `extra-conv-layer` |
+| d_model 256 -> 384 | `d384` |
+
+Keep `--experiment ecg-ssl` the same across all of them. Old and new belong in
+one table — that comparison is the whole point, and separate experiments would
+turn it into a manual join.
+
+The run also logs the git commit and whether the tree was dirty, because the
+variant is a label you type and the commit is not. **Commit before you run**: a
+dirty tree means the SHA names something that is not what ran, and the study
+will say so in `git_dirty`.
+
+If you re-run across a code change without moving the variant, the runner
+prints the commit each skipped run came from and warns at the end. That warning
+means the results on screen are the old model's.
 """
 )
 
 code(
     """
-MASK_RATIO = 0.5  # <- from cell 7
+MASK_RATIO = 0.5       # <- from cell 7
+VARIANT = "base"       # <- change whenever you change the model
 
 !ecg-run \\
     --store "$STORE" --metadata "$METADATA" \\
     --output "$RUNS/study" --tracking /content/mlruns/mlflow.db \\
-    --experiment ecg-ssl \\
+    --experiment ecg-ssl --variant $VARIANT \\
     --mask-ratio $MASK_RATIO --mask-span 2 \\
     --fractions 0.2 0.5 1.0 \\
     --epochs 50 --batch-size 256 --d-model 256 --n-layers 4 --n-heads 8
 """
 )
 
-md("## 9. Results")
+md(
+    """
+## 9. Results
+
+`load_results` rather than `results.csv`: the CSV holds only the plan that last
+ran, so a second variant's study overwrites the first's summary. The per-run
+`result.json` files are never overwritten — each variant has its own
+directories — so this rebuilds the full table from them, **every variant
+included**.
+
+When more than one variant is present, the tables below split by it instead of
+averaging across it. Two architectures averaged into one row would be a number
+that describes neither.
+"""
+)
 
 code(
     """
-import pandas as pd
+from ecg.experiments.runner import label_efficiency_table, load_results, ssl_benefit
 
-from ecg.experiments.runner import label_efficiency_table, ssl_benefit
-
-frame = pd.read_csv(RUNS / "study" / "results.csv")
+frame = load_results(RUNS / "study")
+print(frame.groupby("variant")["run"].count().to_string(), "\\n")
 
 print("label efficiency (test macro AUROC)")
 print(label_efficiency_table(frame).to_string())
@@ -365,7 +420,10 @@ print("\\nembedder comparison at each fraction (test macro AUROC)")
 print(
     frame[frame["kind"] == "supervised"]
     .pivot_table(
-        index=["label_fraction", "pretrained"],
+        # variant first, always: A/B and C/D are only valid within one
+        # architecture, so the level has to be visible even when there is
+        # currently only one.
+        index=["variant", "label_fraction", "pretrained"],
         columns="embedder",
         values="test_macro_auroc",
     )
@@ -379,6 +437,12 @@ md(
 ## 10. The label-efficiency curve
 
 The study's headline figure: does the SSL gap widen as labels get scarcer?
+
+**One architecture per figure.** The four arms are only comparable within a
+variant, so the cell plots `VARIANT` from cell 8; change it and re-run to see
+another. Overlaying two architectures here would put eight lines on two panels
+and make the SSL gap — the thing the figure exists to show — the hardest thing
+on it to see.
 """
 )
 
@@ -387,6 +451,8 @@ code(
 import matplotlib.pyplot as plt
 
 curve = label_efficiency_table(frame)
+if "variant" in (curve.index.names or []):
+    curve = curve.loc[VARIANT]
 fig, axes = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
 
 for axis, embedder in zip(axes, ("linear", "conv")):
@@ -399,7 +465,7 @@ for axis, embedder in zip(axes, ("linear", "conv")):
     axis.legend()
 
 axes[0].set_ylabel("test macro AUROC")
-fig.suptitle("Does SSL help more when labels are scarce?")
+fig.suptitle(f"Does SSL help more when labels are scarce?  ({VARIANT})")
 fig.tight_layout()
 plt.show()
 """
@@ -437,6 +503,35 @@ nb["metadata"] = {
     "language_info": {"name": "python"},
 }
 
+
+def refuse_to_clobber(destination: Path, writing: int) -> None:
+    """Stop if the notebook on disk holds work this script would delete.
+
+    A generator that silently overwrites is a loaded gun once anyone edits the
+    notebook directly. Cell count is a crude test but it catches the case that
+    actually happens: cells added in Jupyter and never back-ported here.
+
+    Args:
+        destination: The notebook that would be overwritten.
+        writing: How many cells this script is about to write.
+
+    Raises:
+        SystemExit: If the existing notebook has more cells.
+    """
+    if not destination.exists() or "--force" in sys.argv:
+        return
+    existing = len(json.loads(destination.read_text(encoding="utf-8"))["cells"])
+    if existing > writing:
+        raise SystemExit(
+            f"refusing to overwrite {destination.name}: it has {existing} cells, "
+            f"this script writes {writing}. Those extra cells were added to the "
+            "notebook directly and are not in this script -- regenerating would "
+            "delete them. Edit the notebook instead, or pass --force if you "
+            "really mean to rebuild it from scratch."
+        )
+
+
+refuse_to_clobber(DEST, len(cells))
 DEST.parent.mkdir(parents=True, exist_ok=True)
 nbf.write(nb, DEST)
 print(f"wrote {DEST} with {len(cells)} cells")

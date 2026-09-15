@@ -1,7 +1,14 @@
-"""Generate the MLflow exploration notebook."""
+"""Generate the MLflow exploration notebook.
+
+This script is currently the source of truth for the notebook -- edit here and
+regenerate. The guard at the bottom refuses to overwrite once that stops being
+true, i.e. once someone adds cells in Jupyter without back-porting them.
+"""
 
 from __future__ import annotations
 
+import json
+import sys
 from pathlib import Path
 
 import nbformat as nbf
@@ -198,6 +205,12 @@ print(
         \"\"\"
         SELECT e.name AS experiment,
                r.name AS run,
+               (SELECT value FROM tags t
+                 WHERE t.run_uuid = r.run_uuid AND t.key = 'variant') AS variant,
+               (SELECT value FROM tags t
+                 WHERE t.run_uuid = r.run_uuid AND t.key = 'git_sha') AS git_sha,
+               (SELECT value FROM tags t
+                 WHERE t.run_uuid = r.run_uuid AND t.key = 'git_dirty') AS dirty,
                r.status,
                datetime(r.start_time / 1000, 'unixepoch') AS started,
                ROUND((r.end_time - r.start_time) / 60000.0, 1) AS minutes,
@@ -208,6 +221,29 @@ print(
         \"\"\"
     ).to_string(index=False)
 )
+"""
+)
+
+md(
+    """
+### Reading the variant and commit columns
+
+`variant` is the label passed to `--variant`; `git_sha` and `dirty` are the
+code that actually ran. Both exist because neither is sufficient alone.
+
+A **variant** with no commit behind it is a label someone typed — nothing stops
+two different architectures carrying the same one. A **commit** with no variant
+is precise but unreadable, and does not group the fourteen runs of one study.
+
+Two things to look for:
+
+- **`dirty = true`** — the tree had uncommitted changes, so `git_sha` names
+  something that is not what ran. Treat that run as unreproducible.
+- **One variant spanning several commits** — you changed code mid-study. The
+  arms are then not strictly comparable, which is the thing `--variant` exists
+  to prevent. Runs before and after the change belong to different studies.
+
+`None` in these columns means the run predates this tagging.
 """
 )
 
@@ -260,12 +296,19 @@ the full config.
 **A/B and C/D are only valid if this table shows one difference.** Architecture,
 optimiser and budget must be identical between the arms being compared; the
 embedder is the single thing allowed to vary.
+
+`variant` is logged as a parameter as well as a tag, so it appears here as its
+own row. If the database holds more than one architecture, **restrict to a
+single variant before reading this table** — otherwise the varying rows are the
+differences between architectures, which are supposed to differ, and the check
+tells you nothing. Set `only_runs` below to do that.
 """
 )
 
 code(
     """
 only_varying = True
+only_runs = None  # e.g. "deep6" to keep just that variant's runs
 
 params = q(
     \"\"\"
@@ -275,6 +318,8 @@ params = q(
     \"\"\"
 ).pivot(index="key", columns="run", values="value")
 
+if only_runs:
+    params = params.loc[:, params.columns.str.contains(only_runs)]
 if only_varying:
     params = params[params.nunique(axis=1, dropna=False) > 1]
 params
@@ -446,6 +491,29 @@ nb["metadata"] = {
     "language_info": {"name": "python"},
 }
 
+def refuse_to_clobber(destination: Path, writing: int) -> None:
+    """Stop if the notebook on disk holds cells this script would delete.
+
+    Args:
+        destination: The notebook that would be overwritten.
+        writing: How many cells this script is about to write.
+
+    Raises:
+        SystemExit: If the existing notebook has more cells.
+    """
+    if not destination.exists() or "--force" in sys.argv:
+        return
+    existing = len(json.loads(destination.read_text(encoding="utf-8"))["cells"])
+    if existing > writing:
+        raise SystemExit(
+            f"refusing to overwrite {destination.name}: it has {existing} cells, "
+            f"this script writes {writing}. Those extra cells are not in this "
+            "script -- regenerating would delete them. Edit the notebook "
+            "instead, or pass --force to rebuild from scratch."
+        )
+
+
+refuse_to_clobber(DEST, len(cells))
 DEST.parent.mkdir(parents=True, exist_ok=True)
 nbf.write(nb, DEST)
 print(f"wrote {DEST} with {len(cells)} cells")
