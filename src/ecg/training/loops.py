@@ -268,9 +268,13 @@ def train_supervised(
     """Train or fine-tune a classifier.
 
     Model selection uses validation macro AUROC only; test is never read here
-    (integrity rule 2). Per-class F1 thresholds are chosen on validation at the
-    best epoch and stored in the checkpoint, so the test evaluation applies
-    fixed numbers rather than fitting its own.
+    (integrity rule 2). Per-class F1 thresholds are chosen on validation at
+    every evaluated epoch; the caller refits them on validation at the selected
+    epoch and passes those fixed numbers to test, so the test evaluation never
+    fits its own.
+
+    ``val_loss`` is logged alongside the ranking metrics but nothing selects on
+    it -- see :data:`SELECTION_METRIC`.
 
     Args:
         model: Classifier, optionally with a pretrained encoder already loaded.
@@ -310,9 +314,14 @@ def train_supervised(
         if (epoch + 1) % config.train.eval_every and epoch + 1 != config.train.epochs:
             continue
 
-        metrics = evaluate_classifier(model, val_batches)
+        y_true, y_score = predict(model, val_batches)
+        metrics = evaluate(y_true, y_score, select_thresholds(y_true, y_score))
         record = metrics.to_mlflow("val")
         record["train_loss"] = total / max(1, n_steps)
+        # Logged, never selected on: SELECTION_METRIC stays val macro AUROC.
+        # It costs nothing -- the scores are already in hand -- and without it a
+        # training curve has no validation counterpart to plot against.
+        record["val_loss"] = _binary_cross_entropy(y_true, y_score)
         record["lr"] = float(optimiser.param_groups[0]["lr"])
         record["epoch"] = float(epoch)
         result.history.append(record)
@@ -366,6 +375,27 @@ def evaluate_classifier(
     if thresholds is None:
         thresholds = select_thresholds(y_true, y_score)
     return evaluate(y_true, y_score, thresholds)
+
+
+def _binary_cross_entropy(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Mean BCE over every record and class, from probabilities.
+
+    Recomputed from the scores rather than accumulated during the validation
+    pass, so it needs no extra forward pass. Probabilities are clipped away from
+    0 and 1 because a confident-and-wrong prediction would otherwise send the
+    mean to infinity and blank the curve it exists to draw.
+
+    Args:
+        y_true: ``(n_records, n_classes)`` binary labels.
+        y_score: ``(n_records, n_classes)`` predicted probabilities.
+
+    Returns:
+        The mean loss.
+    """
+    scores = np.clip(y_score, 1e-7, 1 - 1e-7)
+    return float(
+        -np.mean(y_true * np.log(scores) + (1 - y_true) * np.log(1 - scores))
+    )
 
 
 def _reconstruction_loss(
