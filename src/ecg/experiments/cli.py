@@ -30,7 +30,7 @@ from ecg.experiments.runner import (
     ssl_benefit,
 )
 from ecg.models.config import ModelConfig, SslConfig
-from ecg.training.config import RunConfig, TrainConfig
+from ecg.training.config import DEFAULT_VARIANT, RunConfig, TrainConfig
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,6 +62,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--experiment", default="ecg-ssl", help="MLflow experiment.")
+    parser.add_argument(
+        "--variant",
+        default=DEFAULT_VARIANT,
+        help=(
+            "Architecture variant, e.g. 'deep6'. Set this whenever you change "
+            "the model: it prefixes every run name, so the new runs get their "
+            "own directories instead of being skipped as already complete, and "
+            "they are filterable in MLflow. Name what changed, not a version "
+            "number. Keep --experiment the same so old and new stay comparable."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -139,6 +150,7 @@ def base_config(args: argparse.Namespace) -> RunConfig:
     output = Path(args.output)
     warn_if_mounted(args.tracking)
     return RunConfig(
+        variant=args.variant,
         model=ModelConfig(
             d_model=args.d_model, n_layers=args.n_layers, n_heads=args.n_heads
         ),

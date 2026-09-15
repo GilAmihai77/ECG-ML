@@ -9,13 +9,16 @@ one run or the whole study.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
 import ecg.experiments.runner as runner
+import ecg.training.tracking as tracking
 from ecg.data.datasets import Cohort
 from ecg.data.preprocess import LEADS, SCALE, WaveformStore
 from ecg.data.ptbxl import SUPERCLASSES
@@ -27,12 +30,14 @@ from ecg.experiments.plan import (
     experiment_plan,
     pretrain_name,
     supervised_name,
+    variant_name,
 )
 from ecg.experiments.runner import (
     RESULT_FILE,
     RunOutcome,
     Workspace,
     label_efficiency_table,
+    load_results,
     results_frame,
     run_one,
     run_plan,
@@ -40,7 +45,8 @@ from ecg.experiments.runner import (
 )
 from ecg.training.loops import resolve_device
 from ecg.models.config import ModelConfig, SslConfig
-from ecg.training.config import RunConfig, TrainConfig
+from ecg.training.config import DEFAULT_VARIANT, RunConfig, TrainConfig
+from ecg.training.tracking import UNKNOWN, git_provenance
 
 N_RECORDS = 64
 N_SAMPLES = 200
@@ -261,6 +267,164 @@ class TestRunner:
         assert outcome.best_epoch <= outcome.epochs_run
 
 
+class TestVariant:
+    """Telling one architecture's results from another's.
+
+    The failure this guards against is silent: a run name says which embedder
+    and which label fraction, nothing about the architecture, and a run name is
+    also its output directory. Change the model, re-run, and every run is
+    skipped as already complete -- handing back the old model's numbers with no
+    error anywhere.
+    """
+
+    def test_default_variant_leaves_names_untouched(self, base: RunConfig) -> None:
+        """An existing study must keep resuming, not re-run under new names."""
+        assert variant_name(DEFAULT_VARIANT, "sup-linear-ssl-f020") == (
+            "sup-linear-ssl-f020"
+        )
+        names = {s.name for s in experiment_plan(base)}
+        assert "sup-conv-ssl-f100" in names
+
+    def test_a_named_variant_prefixes_every_run(self, base: RunConfig) -> None:
+        specs = experiment_plan(base.with_(variant="deep6"))
+        assert all(s.name.startswith("deep6-") for s in specs)
+        assert all(s.config.variant == "deep6" for s in specs)
+
+    def test_variants_never_share_a_directory(self, base: RunConfig) -> None:
+        """The whole point: different directories, so resume cannot confuse them."""
+        old = {s.name for s in experiment_plan(base)}
+        new = {s.name for s in experiment_plan(base.with_(variant="deep6"))}
+        assert not (old & new)
+
+    def test_ssl_dependencies_stay_inside_the_variant(self, base: RunConfig) -> None:
+        """A deep6 arm must not fine-tune the base variant's encoder."""
+        for spec in experiment_plan(base.with_(variant="deep6")):
+            if spec.depends_on:
+                assert spec.depends_on.startswith("deep6-")
+                assert spec.depends_on in {s.name for s in experiment_plan(
+                    base.with_(variant="deep6")
+                )}
+
+    def test_ablation_plan_is_prefixed_too(self, base: RunConfig) -> None:
+        specs = ablation_plan(base.with_(variant="deep6"), mask_ratios=(0.3,))
+        assert all(s.name.startswith("deep6-") for s in specs)
+
+    def test_variant_must_be_usable_as_a_directory_name(self, base: RunConfig) -> None:
+        for bad in ("", "two words", "a/b", "a\\b"):
+            with pytest.raises(ValueError, match="variant must be"):
+                base.with_(variant=bad)
+
+    def test_variant_round_trips_through_yaml(self, base, tmp_path) -> None:
+        """Integrity rule 6: the variant is part of the reproducible config."""
+        path = base.with_(variant="deep6").to_yaml(tmp_path / "config.yaml")
+        assert RunConfig.from_yaml(path).variant == "deep6"
+
+    def test_an_old_config_without_a_variant_still_loads(self, base, tmp_path) -> None:
+        payload = base.to_dict()
+        del payload["variant"]
+        assert RunConfig.from_dict(payload).variant == DEFAULT_VARIANT
+
+    def test_describe_plan_names_the_variant(self, base: RunConfig) -> None:
+        text = describe_plan(experiment_plan(base.with_(variant="deep6")))
+        assert "variant deep6" in text
+
+    def test_outcome_records_variant_and_commit(self, base, workspace, tmp_path) -> None:
+        """So results.csv is self-describing without consulting MLflow."""
+        spec = RunSpec("sup", "supervised", base.with_(name="sup", variant="deep6"))
+        outcome = run_one(
+            spec, workspace, output_root=tmp_path / "runs", track=False, progress=False
+        )
+        assert outcome.variant == "deep6"
+        assert outcome.git_sha == git_provenance()["git_sha"]
+        assert RunOutcome.load(tmp_path / "runs" / "sup") == outcome
+        assert results_frame([outcome]).loc[0, "variant"] == "deep6"
+
+    def test_resuming_across_a_code_change_warns(
+        self, base, workspace, tmp_path, monkeypatch
+    ) -> None:
+        """The one case the variant exists to prevent, caught if it happens anyway."""
+        specs = [RunSpec("sup", "supervised", base.with_(name="sup"))]
+        root = tmp_path / "runs"
+        run_plan(specs, workspace, output_root=root, track=False, progress=False)
+
+        monkeypatch.setattr(
+            runner, "git_provenance", lambda *a, **k: {"git_sha": "deadbee"}
+        )
+        with pytest.warns(RuntimeWarning, match="OLD model"):
+            run_plan(specs, workspace, output_root=root, track=False, progress=False)
+
+    def test_resuming_on_the_same_commit_is_quiet(
+        self, base, workspace, tmp_path
+    ) -> None:
+        """A Colab disconnect is the normal case and must not cry wolf."""
+        specs = [RunSpec("sup", "supervised", base.with_(name="sup"))]
+        root = tmp_path / "runs"
+        run_plan(specs, workspace, output_root=root, track=False, progress=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            run_plan(specs, workspace, output_root=root, track=False, progress=False)
+
+
+class TestVariantResults:
+    """Comparing across variants must not silently average them together."""
+
+    def test_load_results_reads_every_variant(self, base, workspace, tmp_path) -> None:
+        """results.csv holds only the last plan; result.json files hold all of them."""
+        root = tmp_path / "runs"
+        for variant in ("base", "deep6"):
+            spec = RunSpec(
+                variant_name(variant, "sup"),
+                "supervised",
+                base.with_(name="sup", variant=variant),
+            )
+            run_one(spec, workspace, output_root=root, track=False, progress=False)
+
+        frame = load_results(root)
+        assert sorted(frame["variant"]) == ["base", "deep6"]
+
+    def test_missing_directory_is_named(self, tmp_path) -> None:
+        with pytest.raises(FileNotFoundError, match="no output directory"):
+            load_results(tmp_path / "absent")
+
+    def test_one_variant_keeps_the_original_shape(self) -> None:
+        frame = _fake_results()
+        assert label_efficiency_table(frame).index.name == "label_fraction"
+        assert ssl_benefit(frame).index.names == ["embedder", "label_fraction"]
+
+    def test_two_variants_are_split_not_averaged(self) -> None:
+        one = _fake_results()
+        other = _fake_results()
+        other["variant"] = "deep6"
+        other["test_macro_auroc"] = other["test_macro_auroc"] + 0.10
+        both = pd.concat([one, other], ignore_index=True)
+
+        curve = label_efficiency_table(both)
+        assert curve.index.names == ["variant", "label_fraction"]
+        # The averaged value would sit between the two; neither row may be it.
+        assert curve.loc["deep6"].to_numpy().max() > curve.loc["base"].to_numpy().max()
+        assert ssl_benefit(both).index.names == [
+            "variant", "embedder", "label_fraction",
+        ]
+
+
+class TestGitProvenance:
+    def test_reports_this_repository(self) -> None:
+        provenance = git_provenance()
+        assert set(provenance) == {"git_sha", "git_dirty"}
+        assert provenance["git_dirty"] in ("true", "false", UNKNOWN)
+
+    def test_a_directory_with_no_repository_is_not_an_error(self, tmp_path) -> None:
+        """Provenance is instrumentation; it must never cost a run."""
+        assert git_provenance(tmp_path) == {"git_sha": UNKNOWN, "git_dirty": UNKNOWN}
+
+    def test_a_missing_git_binary_is_not_an_error(self, monkeypatch, tmp_path) -> None:
+        def explode(*args, **kwargs):
+            raise FileNotFoundError("git")
+
+        monkeypatch.setattr(tracking.subprocess, "run", explode)
+        assert git_provenance(tmp_path)["git_sha"] == UNKNOWN
+
+
 class TestDevicePlacement:
     """The loops move the *model* with ``.to(device)`` and never touch the
     batches, so a cohort built without a device is invisible on a CPU-only box
@@ -401,6 +565,7 @@ def _fake_results():
             rows.append(
                 {
                     "run": f"r{fraction}{pretrained}",
+                    "variant": "base",
                     "kind": "supervised",
                     "arm": "linear+ssl" if pretrained else "linear",
                     "embedder": "linear",

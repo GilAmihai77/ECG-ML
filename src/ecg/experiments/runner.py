@@ -17,6 +17,7 @@ test, because the loop is never handed it.
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,10 +32,10 @@ from ecg.data.ptbxl import load_metadata
 from ecg.models.encoder import build_classifier
 from ecg.models.ssl import build_pretrainer
 from ecg.training.checkpoints import load_encoder_weights
-from ecg.training.config import RunConfig
+from ecg.training.config import DEFAULT_VARIANT, RunConfig
 from ecg.training.loops import evaluate_classifier, pretrain, resolve_device, train_supervised
 from ecg.training.metrics import ClassificationMetrics
-from ecg.training.tracking import Tracker
+from ecg.training.tracking import UNKNOWN, Tracker, git_provenance
 from ecg.experiments.plan import RunSpec
 
 #: Written into a run's output directory when it completes successfully.
@@ -48,6 +49,10 @@ class RunOutcome:
     Attributes:
         name: Run name.
         kind: ``"pretrain"`` or ``"supervised"``.
+        variant: Architecture variant the run belongs to.
+        git_sha: Short commit the run was produced from, so ``results.csv`` is
+            self-describing without consulting MLflow. Defaults keep an older
+            ``result.json`` loadable.
         arm: Arm label, e.g. ``"conv+ssl"``.
         embedder: Which patch embedder was used.
         pretrained: Whether the encoder started from SSL weights.
@@ -77,6 +82,8 @@ class RunOutcome:
     seconds: float
     checkpoint: str
     metrics: dict[str, float] = field(default_factory=dict)
+    variant: str = DEFAULT_VARIANT
+    git_sha: str = UNKNOWN
 
     def save(self, directory: str | Path) -> Path:
         """Write the outcome as JSON, marking the run complete.
@@ -111,6 +118,8 @@ class RunOutcome:
         """Flatten for a results table."""
         row: dict[str, Any] = {
             "run": self.name,
+            "variant": self.variant,
+            "git_sha": self.git_sha,
             "kind": self.kind,
             "arm": self.arm,
             "embedder": self.embedder,
@@ -189,11 +198,16 @@ def run_one(
     )
     config.to_yaml(directory / "config.yaml")
 
+    # Asked once per run, not once per epoch: it shells out to git.
+    provenance = git_provenance()
+
     with Tracker(
         config.tracking_uri, experiment=experiment, run_name=spec.name, enabled=track
     ) as tracker:
         tracker.log_params(config.mlflow_params())
-        tracker.set_tags({"kind": spec.kind, "arm": spec.arm})
+        tracker.set_tags(
+            {"kind": spec.kind, "arm": spec.arm, "variant": config.variant, **provenance}
+        )
         outcome = (
             _run_pretrain(spec, config, workspace, tracker, progress)
             if spec.kind == "pretrain"
@@ -201,6 +215,8 @@ def run_one(
         )
         tracker.log_metrics(outcome.metrics, step=outcome.best_epoch)
 
+    outcome.variant = config.variant
+    outcome.git_sha = provenance["git_sha"]
     outcome.save(directory)
     return outcome
 
@@ -240,6 +256,8 @@ def run_plan(
     root = Path(output_root)
     outcomes: list[RunOutcome] = []
     checkpoints: dict[str, str] = {}
+    current_sha = git_provenance()["git_sha"]
+    stale: list[str] = []
 
     for index, spec in enumerate(specs, start=1):
         directory = root / spec.name
@@ -247,8 +265,13 @@ def run_plan(
             outcome = RunOutcome.load(directory)
             checkpoints[spec.name] = outcome.checkpoint
             outcomes.append(outcome)
+            if outcome.git_sha not in (current_sha, UNKNOWN):
+                stale.append(spec.name)
             if progress:
-                print(f"[{index}/{len(specs)}] {spec.name}: already complete, skipping")
+                print(
+                    f"[{index}/{len(specs)}] {spec.name}: already complete "
+                    f"(variant {outcome.variant}, git {outcome.git_sha}), skipping"
+                )
             continue
 
         resolved = spec
@@ -282,6 +305,20 @@ def run_plan(
         checkpoints[spec.name] = outcome.checkpoint
         outcomes.append(outcome)
 
+    if stale:
+        # The one failure this scheme exists to catch: the code changed, the
+        # run names did not, so resume returns the previous architecture's
+        # numbers as if they were the new one's. Pass --variant to separate
+        # them, or --no-resume to overwrite.
+        warnings.warn(
+            f"{len(stale)} run(s) were skipped that were produced by a "
+            f"different commit than the current {current_sha}: "
+            f"{', '.join(stale[:4])}{' ...' if len(stale) > 4 else ''}. "
+            "If you changed the model, these results are the OLD model's -- "
+            "re-run under a new --variant.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return outcomes
 
 
@@ -297,6 +334,50 @@ def results_frame(outcomes: list[RunOutcome]) -> pd.DataFrame:
     return pd.DataFrame([outcome.to_row() for outcome in outcomes])
 
 
+def load_results(output_root: str | Path) -> pd.DataFrame:
+    """Rebuild the results table from every finished run under a directory.
+
+    ``results.csv`` holds only the plan that last executed, so running a second
+    variant overwrites the first variant's summary. The per-run
+    ``result.json`` files are not overwritten -- each variant has its own
+    directories -- so the full history is always recoverable from them, and
+    this is what a comparison across variants should read.
+
+    Args:
+        output_root: Directory holding one subdirectory per run.
+
+    Returns:
+        One row per finished run, every variant included, sorted by variant
+        then run name. Empty if nothing has finished.
+
+    Raises:
+        FileNotFoundError: If the directory does not exist.
+    """
+    root = Path(output_root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"no output directory at {root}")
+
+    outcomes = [
+        RunOutcome.load(directory)
+        for directory in sorted(p for p in root.iterdir() if p.is_dir())
+        if (directory / RESULT_FILE).exists()
+    ]
+    if not outcomes:
+        return pd.DataFrame()
+    return results_frame(outcomes).sort_values(["variant", "run"], ignore_index=True)
+
+
+def _grouped(frame: pd.DataFrame, index: list[str]) -> list[str]:
+    """Prepend ``variant`` to a pivot index when the frame holds more than one.
+
+    Without this, a table covering two architectures would average them into a
+    single row -- silently, and into a number that describes neither.
+    """
+    if "variant" in frame.columns and frame["variant"].nunique() > 1:
+        return ["variant", *index]
+    return index
+
+
 def label_efficiency_table(
     frame: pd.DataFrame, metric: str = "test_macro_auroc"
 ) -> pd.DataFrame:
@@ -307,11 +388,16 @@ def label_efficiency_table(
         metric: Column to display.
 
     Returns:
-        Label fractions as rows, arms as columns.
+        Label fractions as rows, arms as columns. If the frame covers several
+        architecture variants, they become the outer row level rather than
+        being averaged together.
     """
     supervised = frame[frame["kind"] == "supervised"]
     return supervised.pivot_table(
-        index="label_fraction", columns="arm", values=metric, aggfunc="mean"
+        index=_grouped(supervised, ["label_fraction"]),
+        columns="arm",
+        values=metric,
+        aggfunc="mean",
     )
 
 
@@ -326,11 +412,12 @@ def ssl_benefit(
 
     Returns:
         Rows indexed by ``(embedder, label_fraction)`` with the scratch score,
-        the pretrained score and their difference.
+        the pretrained score and their difference. Architecture variants are
+        kept apart as an outer row level rather than averaged.
     """
     supervised = frame[frame["kind"] == "supervised"]
     pivot = supervised.pivot_table(
-        index=["embedder", "label_fraction"],
+        index=_grouped(supervised, ["embedder", "label_fraction"]),
         columns="pretrained",
         values=metric,
         aggfunc="mean",

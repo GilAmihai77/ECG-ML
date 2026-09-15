@@ -15,6 +15,7 @@ from ecg.experiments.plan import (
     experiment_plan,
     pretrain_name,
     supervised_name,
+    variant_name,
 )
 from ecg.experiments.report import (
     RunPredictions,
@@ -33,6 +34,7 @@ from ecg.experiments.runner import (
     RunOutcome,
     Workspace,
     label_efficiency_table,
+    load_results,
     results_frame,
     run_one,
     run_plan,
@@ -52,6 +54,7 @@ __all__ = [
     "experiment_plan",
     "label_distribution",
     "label_efficiency_table",
+    "load_results",
     "per_class_table",
     "plot_label_distribution",
     "plot_pr_curves",
@@ -64,4 +67,5 @@ __all__ = [
     "style_table",
     "supervised_name",
     "training_history",
+    "variant_name",
 ]

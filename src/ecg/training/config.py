@@ -22,6 +22,11 @@ import yaml
 
 from ecg.models.config import ModelConfig, SslConfig
 
+#: Variant name for the original architecture. Runs in the default variant are
+#: named exactly as they always were, so a study that already finished still
+#: resumes instead of re-running under a new name.
+DEFAULT_VARIANT: str = "base"
+
 
 @dataclass(frozen=True)
 class TrainConfig:
@@ -78,6 +83,14 @@ class RunConfig:
 
     Attributes:
         name: Run name, used for MLflow and the checkpoint directory.
+        variant: Which version of the architecture this run belongs to, e.g.
+            ``"deep6"``. It prefixes every run name, so two variants never
+            share an output directory and never collide in MLflow. Pick a slug
+            that says what changed; a version ladder stops meaning anything
+            after the fourth change. The label alone does not prove two runs
+            ran the same code -- see
+            :func:`ecg.training.tracking.git_provenance` for the part that
+            does.
         model: Architecture, including which embedder this arm uses.
         train: Optimisation budget.
         ssl: Masking settings; only read by pretraining runs.
@@ -103,6 +116,7 @@ class RunConfig:
     """
 
     name: str = "run"
+    variant: str = DEFAULT_VARIANT
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     ssl: SslConfig = field(default_factory=SslConfig)
@@ -120,9 +134,18 @@ class RunConfig:
         """Validate the run.
 
         Raises:
-            ValueError: If ``label_fraction`` is outside ``(0, 1]`` or
-                ``ssl_holdout`` is outside ``[0, 1)``.
+            ValueError: If ``label_fraction`` is outside ``(0, 1]``,
+                ``ssl_holdout`` is outside ``[0, 1)``, or ``variant`` is not
+                usable as a directory name.
         """
+        # The variant becomes part of a run name, and a run name becomes a
+        # directory on Drive. Rejecting separators here turns a confusing
+        # mid-study path error into an immediate one.
+        if not self.variant or any(bad in self.variant for bad in "/\\ "):
+            raise ValueError(
+                f"variant must be a non-empty slug without spaces or path "
+                f"separators, got {self.variant!r}"
+            )
         if not 0.0 < self.label_fraction <= 1.0:
             raise ValueError(
                 f"label_fraction must be in (0, 1], got {self.label_fraction}"

@@ -14,6 +14,7 @@ than pointing MLflow at Drive directly.
 
 from __future__ import annotations
 
+import subprocess
 import warnings
 from pathlib import Path
 from types import TracebackType
@@ -22,6 +23,56 @@ from typing import Any
 #: How many tracking failures to warn about before going quiet. A broken mount
 #: would otherwise emit one warning per metric per epoch.
 WARN_LIMIT: int = 3
+
+#: Value used when git cannot answer. Distinct from a real SHA, so a run with
+#: unknown provenance is visible as such rather than looking clean.
+UNKNOWN: str = "unknown"
+
+
+def git_provenance(path: str | Path | None = None) -> dict[str, str]:
+    """Identify the code that is about to run, as MLflow tags.
+
+    Hyperparameters cannot do this on their own. Rewriting the encoder while
+    ``d_model``, ``n_layers`` and ``n_heads`` stay put leaves every logged
+    parameter byte-identical, so two architectures' runs become
+    indistinguishable in the tracking database -- exactly the case where you
+    most need to tell them apart. The commit is what separates them, and
+    ``git_dirty`` is what stops the commit from being a lie: a modified tree
+    means the SHA names something that is not what ran.
+
+    Never raises. Git may be absent, the package may have been installed from a
+    wheel with no repository around it, and neither is worth losing a run over.
+
+    Args:
+        path: Directory to ask git about. Defaults to this file's own, so the
+            answer describes the installed package rather than the working
+            directory the command happened to be issued from.
+
+    Returns:
+        ``git_sha`` (short commit or ``"unknown"``) and ``git_dirty``
+        (``"true"``, ``"false"`` or ``"unknown"``).
+    """
+    root = str(Path(path) if path is not None else Path(__file__).parent)
+
+    def ask(*arguments: str) -> str | None:
+        try:
+            done = subprocess.run(
+                ["git", "-C", root, *arguments],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:  # noqa: BLE001 - provenance must not break a run
+            return None
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    sha = ask("rev-parse", "--short", "HEAD")
+    if sha is None:
+        return {"git_sha": UNKNOWN, "git_dirty": UNKNOWN}
+    status = ask("status", "--porcelain")
+    dirty = UNKNOWN if status is None else str(bool(status)).lower()
+    return {"git_sha": sha, "git_dirty": dirty}
 
 
 def normalise_tracking_uri(uri: str | Path) -> str:

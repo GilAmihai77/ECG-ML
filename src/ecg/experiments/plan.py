@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ecg.models.config import Embedder
-from ecg.training.config import RunConfig
+from ecg.training.config import DEFAULT_VARIANT, RunConfig
 
 RunKind = Literal["pretrain", "supervised"]
 
@@ -59,6 +59,29 @@ class RunSpec:
     def arm(self) -> str:
         """Arm label, e.g. ``"conv+ssl"``."""
         return self.config.arm
+
+
+def variant_name(variant: str, stem: str) -> str:
+    """Prefix a run name with its architecture variant.
+
+    A run name is also its output directory, and ``run_plan`` skips any
+    directory that already holds a ``result.json``. So without this, changing
+    the architecture and re-running would skip all fourteen runs and hand back
+    the previous architecture's numbers -- silently, since nothing in a run
+    name mentions the architecture.
+
+    The default variant is deliberately left unprefixed: an existing study
+    keeps the names it already has, and its finished runs still resume instead
+    of being re-run under new ones.
+
+    Args:
+        variant: The variant slug, e.g. ``"deep6"``.
+        stem: The name the run would have had, e.g. ``"sup-linear-ssl-f020"``.
+
+    Returns:
+        ``stem`` for the default variant, ``"<variant>-<stem>"`` otherwise.
+    """
+    return stem if variant == DEFAULT_VARIANT else f"{variant}-{stem}"
 
 
 def pretrain_name(embedder: str, mask_ratio: float) -> str:
@@ -120,7 +143,7 @@ def experiment_plan(
     specs: list[RunSpec] = []
 
     for embedder in embedders:
-        name = pretrain_name(embedder, base.ssl.mask_ratio)
+        name = variant_name(base.variant, pretrain_name(embedder, base.ssl.mask_ratio))
         specs.append(
             RunSpec(
                 name=name,
@@ -137,8 +160,16 @@ def experiment_plan(
     for fraction in fractions:
         for embedder in embedders:
             for pretrained in (False, True):
-                source = pretrain_name(embedder, base.ssl.mask_ratio) if pretrained else None
-                name = supervised_name(embedder, pretrained, fraction)
+                source = (
+                    variant_name(
+                        base.variant, pretrain_name(embedder, base.ssl.mask_ratio)
+                    )
+                    if pretrained
+                    else None
+                )
+                name = variant_name(
+                    base.variant, supervised_name(embedder, pretrained, fraction)
+                )
                 specs.append(
                     RunSpec(
                         name=name,
@@ -187,7 +218,7 @@ def ablation_plan(
     specs: list[RunSpec] = []
     for ratio in mask_ratios:
         ssl_config = base.ssl.__class__(mask_ratio=ratio, mask_span=base.ssl.mask_span)
-        name = pretrain_name(embedder, ratio)
+        name = variant_name(base.variant, pretrain_name(embedder, ratio))
         specs.append(
             RunSpec(
                 name=name,
@@ -229,13 +260,14 @@ def describe_plan(specs: list[RunSpec]) -> str:
     Returns:
         A printable multi-line string.
     """
-    lines = [f"{len(specs)} runs", ""]
-    header = f"{'run':32s} {'kind':11s} {'arm':12s} {'labels':>7s} {'mask':>5s}"
+    variants = sorted({spec.config.variant for spec in specs})
+    lines = [f"{len(specs)} runs, variant {', '.join(variants)}", ""]
+    header = f"{'run':40s} {'kind':11s} {'arm':12s} {'labels':>7s} {'mask':>5s}"
     lines += [header, "-" * len(header)]
     for spec in specs:
         labels = "-" if spec.kind == "pretrain" else f"{spec.config.label_fraction:.0%}"
         lines.append(
-            f"{spec.name:32s} {spec.kind:11s} {spec.arm:12s} {labels:>7s} "
+            f"{spec.name:40s} {spec.kind:11s} {spec.arm:12s} {labels:>7s} "
             f"{spec.config.ssl.mask_ratio:>5.2f}"
         )
     return "\n".join(lines)

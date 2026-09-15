@@ -47,7 +47,7 @@ from ecg.data.ptbxl import SUPERCLASSES
 from ecg.experiments.runner import RESULT_FILE, RunOutcome, Workspace, _batches
 from ecg.models.encoder import build_classifier
 from ecg.training.checkpoints import load_checkpoint
-from ecg.training.config import RunConfig
+from ecg.training.config import DEFAULT_VARIANT, RunConfig
 from ecg.training.loops import predict, resolve_device
 from ecg.training.metrics import select_thresholds
 
@@ -246,6 +246,9 @@ class RunPredictions:
         thresholds: Per-class F1 thresholds, fitted on validation.
         y_true: Binary labels per split, ``(n_records, n_classes)``.
         y_score: Predicted probabilities per split, same shape.
+        variant: Architecture variant. Part of a run's identity, because
+            ``(label_fraction, arm)`` alone is not unique once a study
+            directory holds more than one architecture.
     """
 
     name: str
@@ -256,6 +259,7 @@ class RunPredictions:
     thresholds: np.ndarray
     y_true: dict[str, np.ndarray]
     y_score: dict[str, np.ndarray]
+    variant: str = DEFAULT_VARIANT
 
     def table(self, split: str = "test") -> pd.DataFrame:
         """Per-class and averaged metrics for one split.
@@ -429,6 +433,7 @@ def collect_predictions(
                 thresholds=thresholds,
                 y_true=truths,
                 y_score=scores,
+                variant=outcome.variant,
             )
         )
         if progress:
@@ -447,13 +452,16 @@ def comparison_table(
 
     Returns:
         Rows indexed by ``(label_fraction, arm)``, sorted, with macro accuracy,
-        precision, recall, F1, AUROC, PR-AUC and exact-match accuracy.
+        precision, recall, F1, AUROC, PR-AUC and exact-match accuracy. If the
+        runs span several architecture variants, ``variant`` becomes the outer
+        index level, since the pair alone would no longer identify a run.
     """
     rows = []
     for run in runs:
         macro = run.table(split).loc["macro"]
         rows.append(
             {
+                "variant": run.variant,
                 "label_fraction": run.label_fraction,
                 "arm": run.arm,
                 "embedder": run.embedder,
@@ -462,8 +470,11 @@ def comparison_table(
                 "exact_match": run.exact_match(split),
             }
         )
-    frame = pd.DataFrame(rows).sort_values(["label_fraction", "arm"])
-    return frame.set_index(["label_fraction", "arm"])
+    frame = pd.DataFrame(rows).sort_values(["variant", "label_fraction", "arm"])
+    index = ["label_fraction", "arm"]
+    if frame["variant"].nunique() > 1:
+        index = ["variant", *index]
+    return frame.set_index(index)
 
 
 def per_class_table(
@@ -477,14 +488,19 @@ def per_class_table(
         metric: Column of :func:`detailed_metrics` to extract.
 
     Returns:
-        Runs as rows, classes plus ``macro`` as columns.
+        Runs as rows, classes plus ``macro`` as columns. Rows are keyed by
+        ``(label_fraction, arm)``, with ``variant`` prepended when the runs
+        span more than one -- without it two architectures' runs would share a
+        key and one would silently replace the other.
     """
+    collected = list(runs)
+    several = len({run.variant for run in collected}) > 1
     rows = {}
-    for run in runs:
-        table = run.table(split)
-        rows[(run.label_fraction, run.arm)] = table[metric]
+    for run in collected:
+        key = (run.label_fraction, run.arm)
+        rows[(run.variant, *key) if several else key] = run.table(split)[metric]
     frame = pd.DataFrame(rows).T.drop(columns=["weighted"])
-    frame.index.names = ["label_fraction", "arm"]
+    frame.index.names = (["variant"] if several else []) + ["label_fraction", "arm"]
     return frame.sort_index()
 
 
@@ -591,6 +607,9 @@ def plot_pr_curves(
         nrows, ncols, figsize=(3.6 * ncols, 3.4 * nrows), squeeze=False
     )
     flat = axes.ravel()
+    # Only when it disambiguates: on a single-variant study it would repeat the
+    # same word across every panel heading.
+    several = len({run.variant for run in runs}) > 1
 
     for axis, run in zip(flat, runs):
         truth, score = run.y_true[split], run.y_score[split]
@@ -620,7 +639,9 @@ def plot_pr_curves(
             axis,
             xlabel="recall",
             ylabel="precision",
-            title=f"{run.arm}  ·  {run.label_fraction:.0%} labels",
+            title=(
+                f"{run.variant}  ·  " if several else ""
+            ) + f"{run.arm}  ·  {run.label_fraction:.0%} labels",
         )
         # Framed against the surface, not frameless: PR curves decay through the
         # lower left, so a transparent legend sits on top of the lines it names.

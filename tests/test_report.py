@@ -65,7 +65,8 @@ def thresholds(labels: np.ndarray, scores: np.ndarray) -> np.ndarray:
     return select_thresholds(labels, scores)
 
 
-def _run(name: str, arm: str, fraction: float, labels, scores, thresholds):
+def _run(name: str, arm: str, fraction: float, labels, scores, thresholds,
+         variant: str = "base"):
     return RunPredictions(
         name=name,
         arm=arm,
@@ -75,6 +76,7 @@ def _run(name: str, arm: str, fraction: float, labels, scores, thresholds):
         thresholds=thresholds,
         y_true={"val": labels, "test": labels},
         y_score={"val": scores, "test": scores},
+        variant=variant,
     )
 
 
@@ -243,6 +245,32 @@ class TestTables:
     ) -> None:
         run = _run("linear-20", "linear", 0.2, labels, scores, thresholds)
         assert run.exact_match("test") < run.table("test").loc["macro", "accuracy"]
+
+    def test_two_variants_are_kept_apart_not_overwritten(
+        self, labels, scores, thresholds
+    ) -> None:
+        """(label_fraction, arm) stops identifying a run once a study directory
+        holds two architectures -- and per_class_table keys a dict with it, so
+        the second would silently replace the first."""
+        runs = [
+            _run(f"{variant}-linear-20", "linear", 0.2, labels, scores, thresholds,
+                 variant=variant)
+            for variant in ("base", "deep6")
+        ]
+        per_class = per_class_table(runs)
+        assert len(per_class) == 2
+        assert per_class.index.names == ["variant", "label_fraction", "arm"]
+
+        comparison = comparison_table(runs)
+        assert len(comparison) == 2
+        assert comparison.index.names == ["variant", "label_fraction", "arm"]
+
+    def test_one_variant_keeps_the_original_index(
+        self, labels, scores, thresholds
+    ) -> None:
+        runs = [_run("linear-20", "linear", 0.2, labels, scores, thresholds)]
+        assert per_class_table(runs).index.names == ["label_fraction", "arm"]
+        assert comparison_table(runs).index.names == ["label_fraction", "arm"]
 
     def test_style_table_renders(self, labels, scores, thresholds) -> None:
         runs = [_run("linear-20", "linear", 0.2, labels, scores, thresholds)]
