@@ -159,8 +159,20 @@ LOCAL = Path("/content/data")
 STORE = LOCAL / "store_100hz"
 METADATA = LOCAL / "ptbxl"
 
+# Replicate seeds, read by both the dry run and the study so the two cannot
+# describe different studies. Every experiment runs once per seed and is
+# reported as mean +/- sd over them.
+#
+# "0 1 2" is a defensible three replicates if you are short of A100 hours, and
+# it extends cleanly: those three keep their run names under "0 1 2 3 4", so
+# adding the last two later re-runs nothing. Do NOT start from "0" alone --
+# a one-seed plan leaves run names unsuffixed, so growing it afterwards
+# re-runs the whole study under new names.
+SEEDS = "0 1 2 3 4"
+
 print(f"drive:  {ECG}")
 print(f"local:  {LOCAL}")
+print(f"seeds:  {SEEDS}")
 """
 )
 
@@ -258,7 +270,7 @@ code(
     """
 !ecg-run --dry-run \\
     --store "$STORE" --metadata "$METADATA" --output "$RUNS/study" \\
-    --fractions 0.2 0.5 1.0 --seeds 0 1 2 3 4 \\
+    --fractions 0.2 0.5 1.0 --seeds $SEEDS \\
     --epochs 50 --d-model 256 --n-heads 8
 """
 )
@@ -333,6 +345,8 @@ code(
 # result. If the three ratios land within noise of each other, re-run it
 # with --seeds 0 1 2 -- picking between them on one seed is picking at
 # random, and the choice is then frozen into all four arms of the study.
+# That re-runs all three: one seed leaves the names unsuffixed, so the runs
+# below are not reused. It is a selection step and cheap; the study is not.
 """
 )
 
@@ -402,7 +416,9 @@ code(
 MASK_RATIO = 0.5       # <- from cell 7
 VARIANT = "base"       # <- change whenever you change the model
 
-# 70 runs. Re-run this cell after a disconnect; finished runs are skipped.
+# 14 runs per seed, so 70 at the default SEEDS (set in cell 2). Re-run this
+# cell after a disconnect; finished runs are skipped. Widening SEEDS later
+# re-runs only the seeds you added, as long as you did not start from one.
 # --share-pretraining would cut it to 62 by pretraining once per embedder
 # instead of once per seed, but then the SSL arm's error bar omits
 # pretraining variance and is narrower than the scratch arm's for a reason
@@ -414,7 +430,7 @@ VARIANT = "base"       # <- change whenever you change the model
     --output "$RUNS/study" --tracking /content/mlruns/mlflow.db \\
     --experiment ecg-ssl --variant $VARIANT \\
     --mask-ratio $MASK_RATIO --mask-span 2 \\
-    --fractions 0.2 0.5 1.0 --seeds 0 1 2 3 4 \\
+    --fractions 0.2 0.5 1.0 --seeds $SEEDS \\
     --epochs 50 --batch-size 256 --d-model 256 --n-layers 4 --n-heads 8
 """
 )
