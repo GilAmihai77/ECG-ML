@@ -129,7 +129,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--patience", type=int, default=0, help="0 disables early stop.")
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=0,
+        help=(
+            "Stop a run after this many evaluations without improvement; 0 "
+            "disables it. Applies to both loops: supervised runs watch val "
+            "macro AUROC, pretraining runs watch the held-out reconstruction "
+            "loss. Treat it as a safety net, not as a licence to set --epochs "
+            "high -- the cosine schedule spans --epochs, so a big budget "
+            "stretches the decay instead of merely capping the run, and a run "
+            "that stops early never anneals. Both loops warn when that happens."
+        ),
+    )
     parser.add_argument("--no-amp", action="store_true", help="Disable bf16 autocast.")
     parser.add_argument("--no-track", action="store_true", help="Disable MLflow.")
     parser.add_argument(

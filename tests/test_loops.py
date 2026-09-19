@@ -8,6 +8,7 @@ the ones that only appear when the pieces are wired together.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -158,13 +159,17 @@ class TestSupervisedLoop:
                 epochs=40, batch_size=16, lr=1e-9, amp=False, device="cpu", patience=2
             )
         )
-        result = train_supervised(
-            build_classifier(patient.model),
-            EcgBatches(store, cohort, batch_size=16, seed=0),
-            EcgBatches(store, cohort, batch_size=16, shuffle=False),
-            patient,
-            progress=False,
-        )
+        # Stopping at epoch 3 of a 40-epoch cosine leaves the rate near peak,
+        # which the loop is required to say rather than let pass as equivalent
+        # to a 3-epoch run.
+        with pytest.warns(RuntimeWarning, match="never reached its low-rate"):
+            result = train_supervised(
+                build_classifier(patient.model),
+                EcgBatches(store, cohort, batch_size=16, seed=0),
+                EcgBatches(store, cohort, batch_size=16, shuffle=False),
+                patient,
+                progress=False,
+            )
         assert result.epochs_run < 40
 
     def test_eval_every_reduces_evaluations(self, learnable, config) -> None:
@@ -305,6 +310,102 @@ class TestPretrainLoop:
         first = _reconstruction_loss(model, batches, config)
         second = _reconstruction_loss(model, batches, config)
         assert first == pytest.approx(second, rel=1e-9)
+
+    def test_early_stopping_halts(self, store, config) -> None:
+        """So a large epoch budget is a ceiling rather than a commitment."""
+        cohort = Cohort(
+            "ssl", store.ecg_ids.copy(),
+            np.zeros((N_RECORDS, len(SUPERCLASSES)), dtype=np.float32),
+        )
+        kept, held = holdout_split(cohort, 0.25, seed=0)
+        # lr small enough that the holdout loss cannot improve, so patience
+        # fires rather than the budget running out.
+        patient = config.with_(
+            train=TrainConfig(
+                epochs=40, batch_size=16, lr=1e-9, amp=False, device="cpu", patience=2
+            )
+        )
+        with pytest.warns(RuntimeWarning, match="never reached its low-rate"):
+            result = pretrain(
+                build_pretrainer(patient.model, patient.ssl),
+                EcgBatches(store, kept, batch_size=16, seed=0),
+                EcgBatches(store, held, batch_size=16, shuffle=False),
+                patient,
+                progress=False,
+            )
+        assert result.epochs_run < 40
+
+    def test_the_best_encoder_survives_an_early_stop(self, store, config) -> None:
+        """The SSL arms fine-tune from this checkpoint, so stopping early must
+        not hand them the last epoch's weights instead of the best."""
+        cohort = Cohort(
+            "ssl", store.ecg_ids.copy(),
+            np.zeros((N_RECORDS, len(SUPERCLASSES)), dtype=np.float32),
+        )
+        kept, held = holdout_split(cohort, 0.25, seed=0)
+        patient = config.with_(
+            train=TrainConfig(
+                epochs=40, batch_size=16, lr=1e-9, amp=False, device="cpu", patience=2
+            )
+        )
+        with pytest.warns(RuntimeWarning):
+            result = pretrain(
+                build_pretrainer(patient.model, patient.ssl),
+                EcgBatches(store, kept, batch_size=16, seed=0),
+                EcgBatches(store, held, batch_size=16, shuffle=False),
+                patient,
+                progress=False,
+            )
+        assert result.best_checkpoint is not None
+        assert Path(result.best_checkpoint).exists()
+        assert result.best_epoch <= result.epochs_run
+        # The durable writes happen before the break, so they describe the run
+        # that actually ran rather than trailing it by `patience` epochs.
+        assert (Path(config.output_dir) / "pretrain_last.pt").exists()
+
+    def test_patience_without_a_holdout_says_it_is_inert(self, store, config) -> None:
+        """Training reconstruction loss falls almost monotonically, so patience
+        on it would never fire -- silently, unless it says so."""
+        cohort = Cohort(
+            "ssl", store.ecg_ids.copy(),
+            np.zeros((N_RECORDS, len(SUPERCLASSES)), dtype=np.float32),
+        )
+        patient = config.with_(
+            train=TrainConfig(
+                epochs=3, batch_size=16, lr=1e-9, amp=False, device="cpu", patience=1
+            )
+        )
+        with pytest.warns(RuntimeWarning, match="no holdout"):
+            result = pretrain(
+                build_pretrainer(patient.model, patient.ssl),
+                EcgBatches(store, cohort, batch_size=16, seed=0),
+                None,
+                patient,
+                progress=False,
+            )
+        assert result.epochs_run == 3
+
+    def test_a_completed_budget_does_not_warn(self, store, config) -> None:
+        """The warning is about stopping early, not about patience existing."""
+        cohort = Cohort(
+            "ssl", store.ecg_ids.copy(),
+            np.zeros((N_RECORDS, len(SUPERCLASSES)), dtype=np.float32),
+        )
+        kept, held = holdout_split(cohort, 0.25, seed=0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            pretrain(
+                build_pretrainer(config.model, config.ssl),
+                EcgBatches(store, kept, batch_size=16, seed=0),
+                EcgBatches(store, held, batch_size=16, shuffle=False),
+                config.with_(
+                    train=TrainConfig(
+                        epochs=3, batch_size=16, lr=3e-3, amp=False,
+                        device="cpu", patience=0,
+                    )
+                ),
+                progress=False,
+            )
 
     def test_checkpoint_can_initialise_a_classifier(self, store, config) -> None:
         """The whole point of arms C and D."""

@@ -194,9 +194,22 @@ def pretrain(
         tracker: Tracker to log to; tracking is skipped when ``None``.
         progress: Print one line per epoch.
 
+    Early stopping needs a held-out signal, so it is active only when
+    ``holdout`` is given. Stopping on the *training* reconstruction loss would
+    be worse than not stopping: it falls almost monotonically, so patience
+    would never fire, and on the occasion it did it would be measuring noise.
+    Pretraining evaluates every epoch, so patience counts epochs here, where in
+    :func:`train_supervised` it counts evaluations.
+
     Returns:
         A :class:`TrainingResult`. The selection metric is the held-out
         reconstruction loss, negated so that larger is better throughout.
+
+    Warns:
+        RuntimeWarning: If ``patience`` is set but no holdout was supplied, so
+            the run silently has no early stopping; or if early stopping fired
+            while the cosine schedule was still near peak learning rate -- see
+            :func:`_warn_if_schedule_incomplete`.
     """
     device = resolve_device(config.train.device)
     model.to(device)
@@ -205,6 +218,18 @@ def pretrain(
     generator = torch.Generator().manual_seed(config.train.seed)
     output = Path(config.output_dir)
     result = TrainingResult()
+    stale = 0
+    stopping = bool(config.train.patience) and holdout is not None
+    if config.train.patience and holdout is None:
+        warnings.warn(
+            "patience is set but this pretraining run has no holdout "
+            "(ssl_holdout=0), so early stopping is disabled: the only "
+            "available signal is the training reconstruction loss, which "
+            "falls almost monotonically. Set ssl_holdout above 0 to get the "
+            "early stop, or set patience to 0 to say you did not want one.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     started = time.perf_counter()
 
     for epoch in range(config.train.epochs):
@@ -246,11 +271,24 @@ def pretrain(
         if score > result.best_score:
             result.best_score = score
             result.best_epoch = epoch
+            stale = 0
             result.best_checkpoint = _persist(
                 output / "pretrain_best.pt", epoch, model, optimiser, config,
                 record, with_optimiser=False,
             )
+        else:
+            stale += 1
         _persist(output / "pretrain_last.pt", epoch, model, optimiser, config, record)
+
+        # After the durable write, not before it: the encoder the SSL arms
+        # fine-tune from is already safe either way, but breaking first would
+        # leave pretrain_last.pt and the synced database a few epochs behind
+        # the run that actually happened.
+        if stopping and stale >= config.train.patience:
+            if progress:
+                print(f"  early stop: {stale} epochs without holdout improvement")
+            _warn_if_schedule_incomplete(optimiser, config.train, epoch)
+            break
 
     result.seconds = time.perf_counter() - started
     return result
@@ -344,11 +382,13 @@ def train_supervised(
             )
         else:
             stale += 1
-            if config.train.patience and stale >= config.train.patience:
-                if progress:
-                    print(f"  early stop: {stale} evaluations without improvement")
-                break
         _persist(output / "last.pt", epoch, model, optimiser, config, record)
+
+        if config.train.patience and stale >= config.train.patience:
+            if progress:
+                print(f"  early stop: {stale} evaluations without improvement")
+            _warn_if_schedule_incomplete(optimiser, config.train, epoch)
+            break
 
     result.seconds = time.perf_counter() - started
     return result
@@ -434,6 +474,49 @@ def _clip(model: nn.Module, grad_clip: float) -> None:
     """Clip gradients by global norm, if enabled."""
     if grad_clip > 0:
         nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+
+#: Fraction of the peak learning rate below which the cosine schedule counts as
+#: having done its job. Above it, a run that stopped early never annealed.
+_ANNEALED_BELOW: float = 0.5
+
+
+def _warn_if_schedule_incomplete(
+    optimiser: torch.optim.Optimizer, config: TrainConfig, epoch: int
+) -> None:
+    """Warn when early stopping cut the cosine schedule short.
+
+    The trap that makes "set a huge epoch budget and let patience decide" a
+    worse idea than it sounds. :func:`build_optimiser` spreads the cosine decay
+    across ``config.epochs``, so raising that number does not merely add a
+    ceiling -- it stretches the schedule. Stop at epoch 60 of 300 and the
+    learning rate is still near peak, so the weights never got the low-rate
+    phase where a transformer consolidates. The run does not fail; it quietly
+    returns a worse encoder than the same number of epochs under a budget that
+    matched.
+
+    So set ``epochs`` to the length the schedule should span and treat patience
+    as the safety net for a run that has plainly stopped improving, rather than
+    as the normal way a run ends.
+
+    Args:
+        optimiser: The optimiser, read for its current learning rate.
+        config: The optimisation budget, for the peak rate.
+        epoch: The epoch the run stopped after, zero-based.
+    """
+    final = float(optimiser.param_groups[0]["lr"])
+    if config.lr <= 0 or final <= _ANNEALED_BELOW * config.lr:
+        return
+    warnings.warn(
+        f"early stop at epoch {epoch + 1} of a {config.epochs}-epoch budget, "
+        f"with the learning rate still at {final / config.lr:.0%} of peak. The "
+        "cosine schedule is spread over the full budget, so this run never "
+        "reached its low-rate phase and is not equivalent to one trained with "
+        f"epochs={epoch + 1}. Lower epochs to roughly the length runs actually "
+        "take, and keep patience as the safety net rather than the usual exit.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 def _persist(

@@ -43,9 +43,21 @@ class TrainConfig:
         amp: Use bfloat16 autocast on CUDA. Ignored on CPU. bf16 needs no
             gradient scaler, unlike fp16, so there is no scaler to misconfigure.
         device: ``"auto"``, ``"cpu"`` or ``"cuda"``.
-        eval_every: Epochs between validation passes.
+        eval_every: Epochs between validation passes. Supervised training only;
+            pretraining evaluates its holdout every epoch.
         patience: Stop after this many evaluations without improvement; ``0``
-            disables early stopping.
+            disables early stopping. Applies to both loops -- supervised
+            training watches val macro AUROC, pretraining watches the held-out
+            reconstruction loss -- so a run of either kind can end before
+            ``epochs``. Because ``eval_every`` is supervised-only, this counts
+            evaluations there and epochs in pretraining; at the default
+            ``eval_every=1`` those are the same thing.
+
+            It is a safety net, not a substitute for choosing ``epochs``. The
+            cosine schedule is spread across ``epochs``, so a large budget
+            stretches the decay rather than merely capping the run, and a run
+            that stops at a fifth of its budget never reaches its low-rate
+            phase. Both loops warn when that happens.
     """
 
     epochs: int = 50
