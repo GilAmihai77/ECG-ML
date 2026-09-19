@@ -2,9 +2,9 @@
 
 The labels are multi-label, not mutually exclusive, so every metric is computed
 per class and then averaged unweighted. Macro averaging rather than micro is
-the point of the study: HYP has 1,138 positives in test against NORM's
-thousands, and micro averaging would let the common classes hide a failure on
-the rare one.
+the point of the study: HYP has 260 positives in the 2,105-record test split
+against NORM's 910, and micro averaging would let the common classes hide a
+failure on the rare one.
 
 Thresholds are a separate concern from ranking. AUROC and PR-AUC need no
 threshold; F1 does. :func:`select_thresholds` picks them **on validation only**
