@@ -293,9 +293,15 @@ to check that it actually was. Rows that differ between runs are the interesting
 ones, so the constant rows are dropped by default — flip `only_varying` to see
 the full config.
 
-**A/B and C/D are only valid if this table shows one difference.** Architecture,
-optimiser and budget must be identical between the arms being compared; the
-embedder is the single thing allowed to vary.
+**A/B and C/D are only valid if this table shows one difference beyond the
+seeds.** Architecture, optimiser and budget must be identical between the arms
+being compared; the embedder is the single thing allowed to vary.
+
+`train.seed` and `subset_seed` vary too, and are supposed to: each experiment
+is replicated across five of them and reported as mean ± sd. They move
+together, always to the same value, so a run where they disagree is a bug. What
+must NOT vary within one `(arm, label_fraction)` is anything else — compare
+runs sharing a seed suffix to read the table with the replicates held still.
 
 `variant` is logged as a parameter as well as a tag, so it appears here as its
 own row. If the database holds more than one architecture, **restrict to a

@@ -69,14 +69,32 @@ and every later `ecg-run` in the session reads from local disk instead.
 ## The order to run in
 
 1. **Cells 1-4** — setup and checks. Fast.
-2. **Cell 5, the dry run** — prints the 14-run grid without booking anything.
-   Read it. This is the cheapest place to catch a wrong fraction.
+2. **Cell 5, the dry run** — prints the 70-run grid without booking anything.
+   Read it. This is the cheapest place to catch a wrong fraction, and the only
+   place the seed count is free to change.
 3. **Cell 6, the timing probe** — one epoch, to turn "about 3 hours" into a
    real number before you commit to the full study.
 4. **Cell 7, the mask-ratio ablation** — 3 pretrains + 3 short fine-tunes,
    selected on validation. Pick the winner and pass it to cell 8.
-5. **Cell 8, the study** — the 14 runs.
+5. **Cell 8, the study** — the 70 runs.
 6. **Cells 9-10** — results.
+
+## Five seeds, and what that costs
+
+Every experiment runs at seeds 0-4 and is reported as mean ± sd. A single run's
+macro AUROC moves by more than the differences this study is trying to measure,
+so one number per arm could not support a claim about either the embedder or
+SSL. The seed drives the weights, the batch order, the SSL mask *and* which
+labelled records the fraction draws — the last one because "if I had a
+different 20% of the labels" is the question a label-scarcity study is actually
+asking.
+
+**This is five times the GPU.** 70 runs, not 14: size it with cell 6 before you
+start, and expect more than one Colab session. That is survivable only because
+resume is per run — see below — so plan on re-running cell 8 until it stops
+finding work. If you are short of time, `--seeds 0 1 2` is a defensible three
+replicates; `--share-pretraining` is the other lever, and cell 8 says what it
+costs you.
 
 ## If Colab disconnects
 
@@ -240,7 +258,8 @@ code(
     """
 !ecg-run --dry-run \\
     --store "$STORE" --metadata "$METADATA" --output "$RUNS/study" \\
-    --fractions 0.2 0.5 1.0 --epochs 50 --d-model 256 --n-heads 8
+    --fractions 0.2 0.5 1.0 --seeds 0 1 2 3 4 \\
+    --epochs 50 --d-model 256 --n-heads 8
 """
 )
 
@@ -252,7 +271,8 @@ One epoch of each kind, so the full study's cost is a measurement rather than a
 guess. It writes to a throwaway directory, so it does not pollute the real
 results or the resume state.
 
-Multiply what you see by `--epochs` to size the study.
+Multiply what you see by `--epochs` **and by the number of seeds** to size
+the study. The probe runs one seed; the study runs five.
 """
 )
 
@@ -307,7 +327,12 @@ code(
     --store "$STORE" --metadata "$METADATA" \\
     --output "$RUNS/ablation" --tracking /content/mlruns/mlflow.db \\
     --experiment ecg-ablation \\
-    --mask-ratios 0.3 0.5 0.7 --fractions 0.2 --epochs 30
+    --mask-ratios 0.3 0.5 0.7 --fractions 0.2 --epochs 30 --seeds 0
+
+# One seed: this selects a mask ratio on validation, it is not a reported
+# result. If the three ratios land within noise of each other, re-run it
+# with --seeds 0 1 2 -- picking between them on one seed is picking at
+# random, and the choice is then frozen into all four arms of the study.
 """
 )
 
@@ -377,12 +402,19 @@ code(
 MASK_RATIO = 0.5       # <- from cell 7
 VARIANT = "base"       # <- change whenever you change the model
 
+# 70 runs. Re-run this cell after a disconnect; finished runs are skipped.
+# --share-pretraining would cut it to 62 by pretraining once per embedder
+# instead of once per seed, but then the SSL arm's error bar omits
+# pretraining variance and is narrower than the scratch arm's for a reason
+# that has nothing to do with SSL. Only worth it if you are out of hours,
+# and it has to be said in the write-up.
+
 !ecg-run \\
     --store "$STORE" --metadata "$METADATA" \\
     --output "$RUNS/study" --tracking /content/mlruns/mlflow.db \\
     --experiment ecg-ssl --variant $VARIANT \\
     --mask-ratio $MASK_RATIO --mask-span 2 \\
-    --fractions 0.2 0.5 1.0 \\
+    --fractions 0.2 0.5 1.0 --seeds 0 1 2 3 4 \\
     --epochs 50 --batch-size 256 --d-model 256 --n-layers 4 --n-heads 8
 """
 )
@@ -405,30 +437,37 @@ that describes neither.
 
 code(
     """
-from ecg.experiments.runner import label_efficiency_table, load_results, ssl_benefit
+from ecg.experiments.runner import (
+    aggregate_runs,
+    embedder_benefit,
+    label_efficiency_report,
+    label_efficiency_table,
+    load_results,
+    ssl_benefit,
+)
 
 frame = load_results(RUNS / "study")
 print(frame.groupby("variant")["run"].count().to_string(), "\\n")
 
-print("label efficiency (test macro AUROC)")
-print(label_efficiency_table(frame).to_string())
+# Which seeds each arm actually has, first. A study that is four-fifths
+# finished produces exactly the same tables below as a finished one; this
+# column is the only thing that says so.
+print(aggregate_runs(frame, metrics=["test_macro_auroc"])[["n_seeds", "seeds"]].to_string())
 
-print("\\nwhat SSL bought")
+print("\\nlabel efficiency (test macro AUROC, mean +/- sd over seeds)")
+print(label_efficiency_report(frame).to_string())
+
+# Both contrasts subtract within a seed and then average, rather than
+# differencing two averages. The means come out the same; the interval does
+# not. A seed that was a bad draw for one arm was the same bad draw for the
+# other -- same records, same batch order -- so pairing takes that shared
+# movement out of the interval instead of leaving it in both terms.
+# gain_beats_noise is the 95% interval on the paired mean excluding zero.
+print("\\nwhat SSL bought (arms C/D against A/B)")
 print(ssl_benefit(frame).to_string())
 
-print("\\nembedder comparison at each fraction (test macro AUROC)")
-print(
-    frame[frame["kind"] == "supervised"]
-    .pivot_table(
-        # variant first, always: A/B and C/D are only valid within one
-        # architecture, so the level has to be visible even when there is
-        # currently only one.
-        index=["variant", "label_fraction", "pretrained"],
-        columns="embedder",
-        values="test_macro_auroc",
-    )
-    .to_string()
-)
+print("\\nwhat the conv stem bought (A against B, C against D)")
+print(embedder_benefit(frame).to_string())
 """
 )
 
@@ -451,21 +490,38 @@ code(
 import matplotlib.pyplot as plt
 
 curve = label_efficiency_table(frame)
+spread = label_efficiency_table(frame, stat="sd").reindex(
+    index=curve.index, columns=curve.columns
+)
 if "variant" in (curve.index.names or []):
     curve = curve.loc[VARIANT]
+    spread = spread.loc[VARIANT]
 fig, axes = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
 
 for axis, embedder in zip(axes, ("linear", "conv")):
     for arm, style in ((embedder, "o--"), (f"{embedder}+ssl", "o-")):
         if arm in curve:
-            axis.plot(curve.index * 100, curve[arm], style, label=arm)
+            # The bar is the seed-to-seed sd of that arm. Overlapping bars do
+            # NOT mean the arms are indistinguishable: most of that spread is
+            # shared between them, and ssl_benefit removes it by pairing. Read
+            # gain_beats_noise there for the comparison; read this for scale.
+            axis.errorbar(
+                curve.index * 100,
+                curve[arm],
+                yerr=spread[arm],
+                fmt=style,
+                capsize=3,
+                label=arm,
+            )
     axis.set_title(f"{embedder} embedder")
     axis.set_xlabel("labelled training data (%)")
     axis.grid(alpha=0.3)
     axis.legend()
 
 axes[0].set_ylabel("test macro AUROC")
-fig.suptitle(f"Does SSL help more when labels are scarce?  ({VARIANT})")
+fig.suptitle(
+    f"Does SSL help more when labels are scarce?  ({VARIANT}, mean +/- sd over seeds)"
+)
 fig.tight_layout()
 plt.show()
 """

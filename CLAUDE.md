@@ -34,9 +34,23 @@ Tracking and durability, as built:
 - Every mlflow call and every checkpoint write is wrapped. Instrumentation must
   never cost an A100 hour.
 
+Replicates:
+Every experiment runs at 5 seeds and is reported as mean +/- sd. One run's
+macro AUROC moves by more than the effects being compared, so a single number
+per arm cannot support a claim about the embedder or about SSL. A seed drives
+weights, batch order, masking AND which labelled records the fraction draws -
+within a seed all four arms still see identical records, so the paired
+comparison is unaffected and only the marginal spread widens.
+Pretraining is replicated per seed too, not shared: an SSL arm fine-tuned five
+times from one encoder would get a narrower interval than the scratch arm for a
+reason unrelated to SSL. --share-pretraining opts out and must be disclosed.
+Both headline comparisons (ssl_benefit, embedder_benefit) subtract within a
+seed and then average, never difference two averages.
+This is 70 runs, not 14. Size it with the timing probe before booking a GPU.
+
 Running the study:
-  ecg-run --dry-run                 # print the 14-run grid, book no GPU
-  ecg-run --plan ablation           # pick the mask ratio first, on val
+  ecg-run --dry-run                 # print the 70-run grid, book no GPU
+  ecg-run --plan ablation --seeds 0 # pick the mask ratio first, on val
   ecg-run --output /content/drive/MyDrive/ecg/runs
 Resuming is the default: a finished run writes result.json and is skipped, so a
 Colab disconnect costs one run rather than the study.

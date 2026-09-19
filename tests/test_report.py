@@ -36,6 +36,7 @@ from ecg.experiments.report import (
     plot_label_distribution,
     plot_pr_curves,
     plot_training_curves,
+    select_seed,
     style_table,
     training_history,
 )
@@ -66,7 +67,7 @@ def thresholds(labels: np.ndarray, scores: np.ndarray) -> np.ndarray:
 
 
 def _run(name: str, arm: str, fraction: float, labels, scores, thresholds,
-         variant: str = "base"):
+         variant: str = "base", seed: int = 0):
     return RunPredictions(
         name=name,
         arm=arm,
@@ -77,7 +78,25 @@ def _run(name: str, arm: str, fraction: float, labels, scores, thresholds,
         y_true={"val": labels, "test": labels},
         y_score={"val": scores, "test": scores},
         variant=variant,
+        seed=seed,
     )
+
+
+def _replicates(labels, scores, thresholds, *, seeds=(0, 1, 2), arm="linear"):
+    """One arm at several seeds, each seed's scores nudged a little."""
+    rng = np.random.default_rng(7)
+    return [
+        _run(
+            f"{arm}-20-s{seed}",
+            arm,
+            0.2,
+            labels,
+            np.clip(scores + rng.normal(0, 0.05, scores.shape), 0.0, 1.0),
+            thresholds,
+            seed=seed,
+        )
+        for seed in seeds
+    ]
 
 
 @pytest.fixture()
@@ -229,8 +248,10 @@ class TestTables:
         assert len(table) == 4
         assert table.index.names == ["label_fraction", "arm"]
         for column in ("accuracy", "precision", "recall", "f1", "auroc", "pr_auc"):
-            assert column in table.columns
-        assert (table["exact_match"].between(0, 1)).all()
+            assert f"{column}_mean" in table.columns
+            assert f"{column}_sd" in table.columns
+        assert (table["exact_match_mean"].between(0, 1)).all()
+        assert (table["n_seeds"] == 1).all()
 
     def test_per_class_table_covers_every_superclass(
         self, labels, scores, thresholds
@@ -275,6 +296,72 @@ class TestTables:
     def test_style_table_renders(self, labels, scores, thresholds) -> None:
         runs = [_run("linear-20", "linear", 0.2, labels, scores, thresholds)]
         assert "<table" in style_table(comparison_table(runs)).to_html()
+
+
+class TestSeeds:
+    """A five-seed study has five runs per (label_fraction, arm), and these
+    tables used to key on that pair alone -- so four of them would have been
+    dropped on the floor with nothing saying so."""
+
+    def test_replicates_collapse_into_mean_and_sd(
+        self, labels, scores, thresholds
+    ) -> None:
+        table = comparison_table(_replicates(labels, scores, thresholds))
+        assert len(table) == 1
+        assert table.iloc[0]["n_seeds"] == 3
+        assert table.iloc[0]["auroc_sd"] > 0
+
+    def test_per_seed_opens_the_row_back_up(self, labels, scores, thresholds) -> None:
+        table = comparison_table(
+            _replicates(labels, scores, thresholds), per_seed=True
+        )
+        assert len(table) == 3
+        assert table.index.names == ["label_fraction", "arm", "seed"]
+
+    def test_per_class_table_keeps_every_replicate(
+        self, labels, scores, thresholds
+    ) -> None:
+        runs = _replicates(labels, scores, thresholds)
+        per_seed = per_class_table(runs, per_seed=True)
+        assert len(per_seed) == 3
+        assert per_seed.index.names == ["label_fraction", "arm", "seed"]
+
+        averaged = per_class_table(runs)
+        assert len(averaged) == 1
+        assert averaged.loc[(0.2, "linear"), "macro"] == pytest.approx(
+            per_seed["macro"].mean()
+        )
+
+    def test_a_single_seed_keeps_the_original_index(
+        self, labels, scores, thresholds
+    ) -> None:
+        """Nothing grows a constant level it does not need."""
+        runs = [_run("linear-20", "linear", 0.2, labels, scores, thresholds)]
+        assert comparison_table(runs).index.names == ["label_fraction", "arm"]
+        assert per_class_table(runs).index.names == ["label_fraction", "arm"]
+
+    def test_select_seed_narrows_a_study(self, labels, scores, thresholds) -> None:
+        runs = _replicates(labels, scores, thresholds)
+        assert [run.seed for run in select_seed(runs)] == [0]
+        assert [run.seed for run in select_seed(runs, 2)] == [2]
+
+    def test_select_seed_names_a_seed_that_is_not_there(
+        self, labels, scores, thresholds
+    ) -> None:
+        with pytest.raises(ValueError, match=r"no run at seed 9"):
+            select_seed(_replicates(labels, scores, thresholds), 9)
+
+    def test_pr_panels_say_which_seed_they_are(
+        self, labels, scores, thresholds
+    ) -> None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        runs = _replicates(labels, scores, thresholds, seeds=(0, 1))
+        figure = plot_pr_curves(runs, ncols=2)
+        assert "seed 0" in figure.axes[0].get_title(loc="left")
+        alone = plot_pr_curves(runs[:1], ncols=1)
+        assert "seed" not in alone.axes[0].get_title(loc="left")
 
 
 class TestTrackingHistory:

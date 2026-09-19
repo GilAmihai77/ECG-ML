@@ -7,6 +7,10 @@ notice a wrong fraction or a wrong mask ratio is here.
 Resuming is the default. After a Colab disconnect, re-issuing the same command
 skips every run that already wrote ``result.json`` and continues from the one
 that was interrupted.
+
+Every experiment runs at five seeds and is reported as mean +/- sd, which is
+also why ``--dry-run`` matters more than it used to: the default study is 70
+runs, not 14. ``--seeds 0`` gets the old single-seed grid back for a smoke test.
 """
 
 from __future__ import annotations
@@ -18,13 +22,16 @@ from pathlib import Path
 from ecg.experiments.plan import (
     DEFAULT_FRACTIONS,
     DEFAULT_MASK_RATIOS,
+    DEFAULT_SEEDS,
     ablation_plan,
     describe_plan,
     experiment_plan,
 )
 from ecg.experiments.runner import (
     Workspace,
-    label_efficiency_table,
+    aggregate_runs,
+    embedder_benefit,
+    label_efficiency_report,
     results_frame,
     run_plan,
     ssl_benefit,
@@ -97,7 +104,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=list(DEFAULT_MASK_RATIOS),
         help="Candidate ratios for the 'ablation' plan.",
     )
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=list(DEFAULT_SEEDS),
+        help=(
+            "Replicate seeds. Every experiment runs once per seed and is "
+            "reported as mean +/- sd, so this multiplies the study's cost by "
+            "its length -- check the run count that --dry-run prints. Each "
+            "seed drives weights, batch order, masking AND which labelled "
+            "records the fraction draws."
+        ),
+    )
+    parser.add_argument(
+        "--share-pretraining",
+        action="store_true",
+        help=(
+            "Pretrain once per embedder instead of once per seed, and "
+            "fine-tune every seed from it. Saves GPU hours; costs the SSL arm "
+            "an interval that omits pretraining variance and so is narrower "
+            "than the scratch arm's for a reason unrelated to SSL. Say so in "
+            "the write-up if you use it."
+        ),
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--patience", type=int, default=0, help="0 disables early stop.")
     parser.add_argument("--no-amp", action="store_true", help="Disable bf16 autocast.")
@@ -158,7 +188,9 @@ def base_config(args: argparse.Namespace) -> RunConfig:
             epochs=args.epochs,
             batch_size=args.batch_size,
             lr=args.lr,
-            seed=args.seed,
+            # Both seeds are overridden per replicate by the plan; the first is
+            # only a placeholder, so a base config printed on its own is honest.
+            seed=args.seeds[0],
             amp=not args.no_amp,
             device=args.device,
             patience=args.patience,
@@ -166,7 +198,7 @@ def base_config(args: argparse.Namespace) -> RunConfig:
         ssl=SslConfig(mask_ratio=args.mask_ratio, mask_span=args.mask_span),
         store_path=args.store,
         metadata_path=args.metadata,
-        subset_seed=args.seed,
+        subset_seed=args.seeds[0],
         experiment=args.experiment,
         tracking_uri=args.tracking,
         output_dir=str(output),
@@ -188,11 +220,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.plan == "ablation":
         specs = ablation_plan(
             base, mask_ratios=tuple(args.mask_ratios), fraction=min(args.fractions),
-            seed=args.seed,
+            seeds=tuple(args.seeds),
         )
     else:
         specs = experiment_plan(
-            base, fractions=tuple(args.fractions), seed=args.seed
+            base,
+            fractions=tuple(args.fractions),
+            seeds=tuple(args.seeds),
+            share_pretraining=args.share_pretraining,
         )
 
     print(describe_plan(specs))
@@ -211,16 +246,30 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     frame = results_frame(outcomes)
-    destination = Path(args.output) / "results.csv"
-    frame.to_csv(destination, index=False)
-    print(f"\nwrote {destination}")
+    output = Path(args.output)
+    frame.to_csv(output / "results.csv", index=False)
+
+    # Two files, because they answer different questions: results.csv is the
+    # per-run record, summary.csv is what a table in the write-up is built from.
+    summary = aggregate_runs(frame)
+    summary.to_csv(output / "summary.csv")
+    print(f"\nwrote {output / 'results.csv'} and {output / 'summary.csv'}")
 
     supervised = frame[frame["kind"] == "supervised"]
     if not supervised.empty:
+        seeds = sorted(supervised["seed"].unique())
+        print(f"\nmean ± sd over {len(seeds)} seed(s) {seeds}")
         print("\nlabel efficiency (test macro AUROC)")
-        print(label_efficiency_table(frame).to_string())
-        print("\nwhat SSL bought")
+        print(label_efficiency_report(frame).to_string())
+        print("\nwhat SSL bought (paired within seed)")
         print(ssl_benefit(frame).to_string())
+        print("\nwhat the conv stem bought (paired within seed)")
+        print(embedder_benefit(frame).to_string())
+        if len(seeds) < 2:
+            print(
+                "\nnote: one seed, so every deviation is undefined and no "
+                "contrast can be shown to beat noise. Pass --seeds 0 1 2 3 4."
+            )
     return 0
 
 

@@ -18,6 +18,11 @@ stored in the checkpoint despite what :func:`ecg.training.loops.train_supervised
 says, so they are refitted on validation here exactly as the runner did, then
 applied unchanged to test.
 
+**A run is one seed.** The study replicates every experiment across seeds, so
+the tables here average over them and report the spread; ``per_seed=True`` opens
+a row back up into the individual runs behind it. The figures are per run, and
+:func:`select_seed` narrows a study to one before plotting.
+
 Macro averaging is **unweighted** throughout -- a plain mean over the classes
 with a defined value, matching :func:`ecg.training.metrics._macro`. That is the
 study's choice, not an oversight: HYP is the rarest superclass, and support
@@ -249,6 +254,10 @@ class RunPredictions:
         variant: Architecture variant. Part of a run's identity, because
             ``(label_fraction, arm)`` alone is not unique once a study
             directory holds more than one architecture.
+        seed: Replicate seed. Also part of a run's identity, and for the same
+            reason: a five-seed study has five runs per ``(label_fraction,
+            arm)``, and a table keyed without it keeps whichever one it read
+            last.
     """
 
     name: str
@@ -260,6 +269,7 @@ class RunPredictions:
     y_true: dict[str, np.ndarray]
     y_score: dict[str, np.ndarray]
     variant: str = DEFAULT_VARIANT
+    seed: int = 0
 
     def table(self, split: str = "test") -> pd.DataFrame:
         """Per-class and averaged metrics for one split.
@@ -434,6 +444,7 @@ def collect_predictions(
                 y_true=truths,
                 y_score=scores,
                 variant=outcome.variant,
+                seed=outcome.seed,
             )
         )
         if progress:
@@ -441,23 +452,53 @@ def collect_predictions(
     return collected
 
 
+def _index_levels(runs: Sequence[RunPredictions], *, per_seed: bool) -> list[str]:
+    """Row-key columns that identify these runs uniquely.
+
+    ``variant`` and ``seed`` are included only when they vary, so a
+    single-variant single-seed study keeps the two-level index it always had
+    rather than growing constant levels that say nothing.
+
+    Args:
+        runs: The runs about to be tabulated.
+        per_seed: Whether rows are one run each, rather than one mean each.
+
+    Returns:
+        Column names, outermost first.
+    """
+    levels = ["label_fraction", "arm"]
+    if len({run.variant for run in runs}) > 1:
+        levels = ["variant", *levels]
+    if per_seed and len({run.seed for run in runs}) > 1:
+        levels = [*levels, "seed"]
+    return levels
+
+
 def comparison_table(
-    runs: Iterable[RunPredictions], *, split: str = "test"
+    runs: Iterable[RunPredictions], *, split: str = "test", per_seed: bool = False
 ) -> pd.DataFrame:
-    """One row per run: the macro numbers side by side.
+    """The macro numbers side by side, averaged over seeds.
 
     Args:
         runs: Runs from :func:`collect_predictions`.
         split: Cohort to report.
+        per_seed: One row per run instead of one row per arm. The default
+            collapses the replicates into ``<metric>_mean`` and
+            ``<metric>_sd``, which is what the study reports; pass ``True`` to
+            inspect the individual runs behind a row.
 
     Returns:
         Rows indexed by ``(label_fraction, arm)``, sorted, with macro accuracy,
-        precision, recall, F1, AUROC, PR-AUC and exact-match accuracy. If the
-        runs span several architecture variants, ``variant`` becomes the outer
-        index level, since the pair alone would no longer identify a run.
+        precision, recall, F1, AUROC, PR-AUC and exact-match accuracy. Levels
+        that vary across the runs -- ``variant``, and ``seed`` under
+        ``per_seed`` -- are added to the key, because without them two runs
+        would share one row. Unless ``per_seed``, each metric becomes a
+        ``_mean`` and ``_sd`` pair, named as in
+        :func:`ecg.experiments.runner.aggregate_runs`, alongside ``n_seeds``.
     """
+    collected = list(runs)
     rows = []
-    for run in runs:
+    for run in collected:
         macro = run.table(split).loc["macro"]
         rows.append(
             {
@@ -466,42 +507,63 @@ def comparison_table(
                 "arm": run.arm,
                 "embedder": run.embedder,
                 "pretrained": run.pretrained,
+                "seed": run.seed,
                 **{name: macro[name] for name in METRIC_COLUMNS[3:]},
                 "exact_match": run.exact_match(split),
             }
         )
-    frame = pd.DataFrame(rows).sort_values(["variant", "label_fraction", "arm"])
-    index = ["label_fraction", "arm"]
-    if frame["variant"].nunique() > 1:
-        index = ["variant", *index]
-    return frame.set_index(index)
+    frame = pd.DataFrame(rows)
+    metrics = [*METRIC_COLUMNS[3:], "exact_match"]
+
+    if per_seed:
+        index = _index_levels(collected, per_seed=True)
+        return frame.sort_values(index).set_index(index)
+
+    index = _index_levels(collected, per_seed=False)
+    grouped = frame.groupby(index, dropna=False, sort=True)
+    summary = pd.DataFrame({"n_seeds": grouped["seed"].nunique()})
+    for metric in metrics:
+        summary[f"{metric}_mean"] = grouped[metric].mean()
+        summary[f"{metric}_sd"] = grouped[metric].std(ddof=1)
+    return summary
 
 
 def per_class_table(
-    runs: Iterable[RunPredictions], *, split: str = "test", metric: str = "f1"
+    runs: Iterable[RunPredictions],
+    *,
+    split: str = "test",
+    metric: str = "f1",
+    per_seed: bool = False,
 ) -> pd.DataFrame:
-    """One metric, every class, every run.
+    """One metric, every class, averaged over seeds.
 
     Args:
         runs: Runs from :func:`collect_predictions`.
         split: Cohort to report.
         metric: Column of :func:`detailed_metrics` to extract.
+        per_seed: One row per run instead of one row per arm.
 
     Returns:
-        Runs as rows, classes plus ``macro`` as columns. Rows are keyed by
-        ``(label_fraction, arm)``, with ``variant`` prepended when the runs
-        span more than one -- without it two architectures' runs would share a
-        key and one would silently replace the other.
+        Arms as rows, classes plus ``macro`` as columns, holding the mean over
+        seeds (or the individual values under ``per_seed``). Rows are keyed by
+        ``(label_fraction, arm)`` plus whichever of ``variant`` and ``seed``
+        varies -- without those a five-seed study would put five runs on one
+        row and keep the last.
     """
     collected = list(runs)
-    several = len({run.variant for run in collected}) > 1
+    index = _index_levels(collected, per_seed=True)
     rows = {}
     for run in collected:
-        key = (run.label_fraction, run.arm)
-        rows[(run.variant, *key) if several else key] = run.table(split)[metric]
+        key = tuple(getattr(run, level) for level in index)
+        rows[key] = run.table(split)[metric]
     frame = pd.DataFrame(rows).T.drop(columns=["weighted"])
-    frame.index.names = (["variant"] if several else []) + ["label_fraction", "arm"]
-    return frame.sort_index()
+    frame.index.names = index
+    frame = frame.sort_index()
+    if per_seed or "seed" not in index:
+        return frame
+    # Averaging is the point of the seeds; the spread lives in
+    # ``comparison_table``, which is where a reader looks for it.
+    return frame.groupby(index[:-1], dropna=False, sort=True).mean()
 
 
 def training_history(
@@ -577,6 +639,38 @@ def _style_axis(axis, *, xlabel: str, ylabel: str, title: str) -> None:
         axis.spines[side].set_color(INK["baseline"])
 
 
+def select_seed(
+    runs: Iterable[RunPredictions], seed: int | None = None
+) -> list[RunPredictions]:
+    """Narrow a study to one seed's runs.
+
+    For the per-run figures. A five-seed study is sixty supervised runs, and
+    :func:`plot_pr_curves` would draw sixty panels -- five near-identical copies
+    of each arm, which is not what a PR figure is for. Aggregate numbers belong
+    in :func:`comparison_table`; the curves show the shape of one representative
+    run and say which one.
+
+    Args:
+        runs: Runs from :func:`collect_predictions`.
+        seed: The seed to keep. ``None`` takes the lowest present.
+
+    Returns:
+        The matching runs, in input order.
+
+    Raises:
+        ValueError: If no run carries that seed.
+    """
+    collected = list(runs)
+    present = sorted({run.seed for run in collected})
+    if seed is None:
+        if not present:
+            return []
+        seed = present[0]
+    elif seed not in present:
+        raise ValueError(f"no run at seed {seed}; have {present}")
+    return [run for run in collected if run.seed == seed]
+
+
 def plot_pr_curves(
     runs: Sequence[RunPredictions],
     *,
@@ -590,6 +684,10 @@ def plot_pr_curves(
     precision a coin-flip classifier would reach. Without it a PR curve is
     unreadable across classes of different base rates, which is exactly the
     comparison being made here.
+
+    One panel per *run*, not per arm, so pass :func:`select_seed` output for a
+    multi-seed study. Given several seeds it draws them all and labels each
+    panel with its seed, rather than picking one silently.
 
     Args:
         runs: Runs from :func:`collect_predictions`.
@@ -610,6 +708,7 @@ def plot_pr_curves(
     # Only when it disambiguates: on a single-variant study it would repeat the
     # same word across every panel heading.
     several = len({run.variant for run in runs}) > 1
+    several_seeds = len({run.seed for run in runs}) > 1
 
     for axis, run in zip(flat, runs):
         truth, score = run.y_true[split], run.y_score[split]
@@ -639,9 +738,9 @@ def plot_pr_curves(
             axis,
             xlabel="recall",
             ylabel="precision",
-            title=(
-                f"{run.variant}  ·  " if several else ""
-            ) + f"{run.arm}  ·  {run.label_fraction:.0%} labels",
+            title=(f"{run.variant}  ·  " if several else "")
+            + f"{run.arm}  ·  {run.label_fraction:.0%} labels"
+            + (f"  ·  seed {run.seed}" if several_seeds else ""),
         )
         # Framed against the surface, not frameless: PR curves decay through the
         # lower left, so a transparent legend sits on top of the lines it names.

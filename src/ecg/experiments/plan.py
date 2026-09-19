@@ -16,12 +16,30 @@ Two plans are defined:
   candidate ratio, fine-tuned at the smallest label fraction only, where SSL's
   effect is largest and the runs are cheapest. Selection is on validation, and
   the winning ratio is then frozen for all four arms of the main study.
+
+**Every experiment is replicated across seeds**, and the study reports mean and
+standard deviation over them rather than one number per arm. A single run's
+macro AUROC moves by more than the effects being compared, so a one-seed table
+cannot distinguish "conv beats linear" from "this initialisation beat that one".
+
+A replicate seed drives *both* sources of run-to-run variation at once:
+
+* ``train.seed`` -- weight initialisation, batch order and the SSL mask draw.
+* ``subset_seed`` -- **which** labelled records the label fraction happens to
+  draw, and which records are held out of the SSL pool.
+
+Including the subset draw is deliberate. In a label-scarcity study it is
+typically the larger of the two, and leaving it fixed would report an interval
+that says "if I re-initialised" when the question is "if I had a different 20%
+of the labels". It costs nothing in the paired comparison: within one seed all
+four arms still see exactly the same records, so the per-seed SSL-minus-scratch
+difference is unaffected and only the marginal spread widens.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Sequence
 
 from ecg.models.config import Embedder
 from ecg.training.config import DEFAULT_VARIANT, RunConfig
@@ -33,6 +51,11 @@ DEFAULT_FRACTIONS: tuple[float, ...] = (0.2, 0.5, 1.0)
 
 #: Mask ratios compared before the main study.
 DEFAULT_MASK_RATIOS: tuple[float, ...] = (0.3, 0.5, 0.7)
+
+#: Replicate seeds. Five is the smallest n for which a standard deviation is
+#: worth printing and the paired interval is not dominated by its own error;
+#: it also multiplies the GPU bill by five, so ``--dry-run`` prints the count.
+DEFAULT_SEEDS: tuple[int, ...] = (0, 1, 2, 3, 4)
 
 #: The two embedders under comparison.
 EMBEDDERS: tuple[Embedder, ...] = ("linear", "conv")
@@ -84,6 +107,30 @@ def variant_name(variant: str, stem: str) -> str:
     return stem if variant == DEFAULT_VARIANT else f"{variant}-{stem}"
 
 
+def seed_name(stem: str, seed: int, *, several: bool) -> str:
+    """Suffix a run name with its replicate seed.
+
+    Like :func:`variant_name`, this exists because a run name is also its
+    output directory and ``run_plan`` skips any directory holding a
+    ``result.json``. Without the suffix all five replicates would write to one
+    directory, the first would be reported five times, and nothing would say so.
+
+    A single-seed plan is left unsuffixed, so a study already on Drive keeps its
+    names and its finished runs still resume. Asking for several seeds renames
+    all of them, seed 0 included: one re-run, in exchange for a table in which
+    no row can be mistaken for an average.
+
+    Args:
+        stem: The name the run would have had, e.g. ``"sup-linear-ssl-f020"``.
+        seed: The replicate seed.
+        several: Whether the plan holds more than one seed.
+
+    Returns:
+        ``stem`` when ``several`` is false, ``"<stem>-s<seed>"`` otherwise.
+    """
+    return f"{stem}-s{seed}" if several else stem
+
+
 def pretrain_name(embedder: str, mask_ratio: float) -> str:
     """Name a pretraining run.
 
@@ -117,76 +164,110 @@ def experiment_plan(
     *,
     fractions: tuple[float, ...] = DEFAULT_FRACTIONS,
     embedders: tuple[Embedder, ...] = EMBEDDERS,
-    seed: int = 0,
+    seeds: tuple[int, ...] = DEFAULT_SEEDS,
+    share_pretraining: bool = False,
 ) -> list[RunSpec]:
-    """Build the full study: pretraining runs, then the four arms.
+    """Build the full study: pretraining runs, then the four arms, every seed.
 
     Ordering matters -- pretraining runs come first because the SSL arms depend
     on their checkpoints -- and :func:`ecg.experiments.runner.run_plan` relies
     on it rather than resolving a graph.
 
-    Every supervised run shares ``base.subset_seed``, so at a given fraction all
-    four arms train on exactly the same records. Varying it per arm would make
-    the label-efficiency curve confound sample size with which patients were
-    drawn.
+    Every supervised run at a given seed shares that seed's ``subset_seed``, so
+    at a given fraction all four arms train on exactly the same records.
+    Varying it *between arms* would make the label-efficiency curve confound
+    sample size with which patients were drawn; varying it *between seeds* is
+    the point, and is what puts the subset draw inside the reported spread.
+
+    Pretraining is replicated per seed by default, so the SSL arm's interval
+    covers the pretraining run as well as the fine-tune. Sharing one encoder
+    across five fine-tunes would give the SSL arm a narrower interval than the
+    scratch arm for a reason that has nothing to do with SSL -- the two error
+    bars would no longer be measuring the same thing.
 
     Args:
         base: Base configuration. Its ``model.embedder`` is overridden per arm;
             everything else is inherited unchanged.
         fractions: Label fractions for the curve.
         embedders: Embedders to compare.
-        seed: Training seed for every run.
+        seeds: Replicate seeds. Each drives weights, batch order, masking and
+            the label-subset draw.
+        share_pretraining: Pretrain once per embedder, at ``seeds[0]``, and
+            fine-tune every seed from it. Cuts the study by one pretraining run
+            per extra seed, at the cost of an SSL interval that understates its
+            own uncertainty. Say so in the write-up if you use it.
 
     Returns:
-        The runs, pretraining first.
+        The runs, pretraining first; within an arm, one run per seed.
+
+    Raises:
+        ValueError: If ``seeds`` is empty or holds a repeat -- a repeated seed
+            would produce two runs with one name, and the second would be
+            skipped as already complete.
     """
+    seeds = _checked_seeds(seeds)
+    several = len(seeds) > 1
+    pretrain_seeds = seeds[:1] if share_pretraining else seeds
+    pretrain_several = len(pretrain_seeds) > 1
+
+    def encoder_for(embedder: str, seed: int) -> str:
+        """Name the pretraining run an SSL arm at this seed fine-tunes from."""
+        source_seed = pretrain_seeds[0] if share_pretraining else seed
+        return variant_name(
+            base.variant,
+            seed_name(
+                pretrain_name(embedder, base.ssl.mask_ratio),
+                source_seed,
+                several=pretrain_several,
+            ),
+        )
+
     specs: list[RunSpec] = []
 
     for embedder in embedders:
-        name = variant_name(base.variant, pretrain_name(embedder, base.ssl.mask_ratio))
-        specs.append(
-            RunSpec(
-                name=name,
-                kind="pretrain",
-                config=base.with_(
+        for seed in pretrain_seeds:
+            name = encoder_for(embedder, seed)
+            specs.append(
+                RunSpec(
                     name=name,
-                    model=base.model.for_arm(embedder),
-                    train=_seeded(base, seed),
-                    pretrained_from=None,
-                ),
+                    kind="pretrain",
+                    config=_replicate(base, seed).with_(
+                        name=name,
+                        model=base.model.for_arm(embedder),
+                        pretrained_from=None,
+                    ),
+                )
             )
-        )
 
     for fraction in fractions:
         for embedder in embedders:
             for pretrained in (False, True):
-                source = (
-                    variant_name(
-                        base.variant, pretrain_name(embedder, base.ssl.mask_ratio)
-                    )
-                    if pretrained
-                    else None
-                )
-                name = variant_name(
-                    base.variant, supervised_name(embedder, pretrained, fraction)
-                )
-                specs.append(
-                    RunSpec(
-                        name=name,
-                        kind="supervised",
-                        config=base.with_(
-                            name=name,
-                            model=base.model.for_arm(embedder),
-                            train=_seeded(base, seed),
-                            label_fraction=fraction,
-                            # Filled in by the runner once the checkpoint path
-                            # is known; kept as the run name here so the plan
-                            # is printable without a filesystem.
-                            pretrained_from=source,
+                for seed in seeds:
+                    source = encoder_for(embedder, seed) if pretrained else None
+                    name = variant_name(
+                        base.variant,
+                        seed_name(
+                            supervised_name(embedder, pretrained, fraction),
+                            seed,
+                            several=several,
                         ),
-                        depends_on=source,
                     )
-                )
+                    specs.append(
+                        RunSpec(
+                            name=name,
+                            kind="supervised",
+                            config=_replicate(base, seed).with_(
+                                name=name,
+                                model=base.model.for_arm(embedder),
+                                label_fraction=fraction,
+                                # Filled in by the runner once the checkpoint
+                                # path is known; kept as the run name here so
+                                # the plan is printable without a filesystem.
+                                pretrained_from=source,
+                            ),
+                            depends_on=source,
+                        )
+                    )
     return specs
 
 
@@ -196,7 +277,7 @@ def ablation_plan(
     mask_ratios: tuple[float, ...] = DEFAULT_MASK_RATIOS,
     embedder: Embedder = "linear",
     fraction: float = 0.2,
-    seed: int = 0,
+    seeds: tuple[int, ...] = (0,),
 ) -> list[RunSpec]:
     """Build the mask-ratio selection.
 
@@ -204,50 +285,63 @@ def ablation_plan(
     per arm would fold the SSL setup into what is being compared, so the ratio
     chosen here is applied unchanged to all four arms.
 
+    Seeds default to one, unlike :func:`experiment_plan`. This is a selection
+    step run on validation, not a reported result, and its cost is paid before
+    the study rather than inside it. Pass several if the candidate ratios come
+    out within noise of each other -- which is the case worth spending on,
+    because picking on a single seed then is picking at random.
+
     Args:
         base: Base configuration.
         mask_ratios: Candidate ratios.
         embedder: Which arm to select on.
         fraction: Label fraction to fine-tune at. The smallest one, where SSL's
             effect is largest and the runs are cheapest.
-        seed: Training seed.
+        seeds: Replicate seeds.
 
     Returns:
         The runs, each pretraining immediately followed by its fine-tune.
+
+    Raises:
+        ValueError: If ``seeds`` is empty or holds a repeat.
     """
+    seeds = _checked_seeds(seeds)
+    several = len(seeds) > 1
     specs: list[RunSpec] = []
     for ratio in mask_ratios:
         ssl_config = base.ssl.__class__(mask_ratio=ratio, mask_span=base.ssl.mask_span)
-        name = variant_name(base.variant, pretrain_name(embedder, ratio))
-        specs.append(
-            RunSpec(
-                name=name,
-                kind="pretrain",
-                config=base.with_(
+        for seed in seeds:
+            name = variant_name(
+                base.variant,
+                seed_name(pretrain_name(embedder, ratio), seed, several=several),
+            )
+            specs.append(
+                RunSpec(
                     name=name,
-                    model=base.model.for_arm(embedder),
-                    train=_seeded(base, seed),
-                    ssl=ssl_config,
-                    pretrained_from=None,
-                ),
+                    kind="pretrain",
+                    config=_replicate(base, seed).with_(
+                        name=name,
+                        model=base.model.for_arm(embedder),
+                        ssl=ssl_config,
+                        pretrained_from=None,
+                    ),
+                )
             )
-        )
-        finetune = f"{name}-f{int(round(fraction * 100)):03d}"
-        specs.append(
-            RunSpec(
-                name=finetune,
-                kind="supervised",
-                config=base.with_(
+            finetune = f"{name}-f{int(round(fraction * 100)):03d}"
+            specs.append(
+                RunSpec(
                     name=finetune,
-                    model=base.model.for_arm(embedder),
-                    train=_seeded(base, seed),
-                    ssl=ssl_config,
-                    label_fraction=fraction,
-                    pretrained_from=name,
-                ),
-                depends_on=name,
+                    kind="supervised",
+                    config=_replicate(base, seed).with_(
+                        name=finetune,
+                        model=base.model.for_arm(embedder),
+                        ssl=ssl_config,
+                        label_fraction=fraction,
+                        pretrained_from=name,
+                    ),
+                    depends_on=name,
+                )
             )
-        )
     return specs
 
 
@@ -261,18 +355,66 @@ def describe_plan(specs: list[RunSpec]) -> str:
         A printable multi-line string.
     """
     variants = sorted({spec.config.variant for spec in specs})
-    lines = [f"{len(specs)} runs, variant {', '.join(variants)}", ""]
-    header = f"{'run':40s} {'kind':11s} {'arm':12s} {'labels':>7s} {'mask':>5s}"
+    seeds = sorted({spec.config.train.seed for spec in specs})
+    # The seed count multiplies the bill, so it goes in the first line a
+    # --dry-run prints rather than having to be counted off the table.
+    lines = [
+        f"{len(specs)} runs, variant {', '.join(variants)}, "
+        f"{len(seeds)} seed(s) {seeds}",
+        "",
+    ]
+    header = (
+        f"{'run':44s} {'kind':11s} {'arm':12s} {'labels':>7s} {'mask':>5s} {'seed':>5s}"
+    )
     lines += [header, "-" * len(header)]
     for spec in specs:
         labels = "-" if spec.kind == "pretrain" else f"{spec.config.label_fraction:.0%}"
         lines.append(
-            f"{spec.name:40s} {spec.kind:11s} {spec.arm:12s} {labels:>7s} "
-            f"{spec.config.ssl.mask_ratio:>5.2f}"
+            f"{spec.name:44s} {spec.kind:11s} {spec.arm:12s} {labels:>7s} "
+            f"{spec.config.ssl.mask_ratio:>5.2f} {spec.config.train.seed:>5d}"
         )
     return "\n".join(lines)
 
 
-def _seeded(base: RunConfig, seed: int):
-    """Return the base training config with its seed replaced."""
-    return base.train.__class__(**{**vars(base.train), "seed": seed})
+def _checked_seeds(seeds: Sequence[int]) -> tuple[int, ...]:
+    """Validate a seed list.
+
+    Args:
+        seeds: Requested replicate seeds.
+
+    Returns:
+        The seeds as a tuple, order preserved.
+
+    Raises:
+        ValueError: If empty, or if a seed repeats. A repeat is worth an error
+            rather than a silent de-duplication: the two runs would share a
+            name, the second would be skipped as already complete, and the
+            study would report ``n=5`` over four distinct runs.
+    """
+    seeds = tuple(seeds)
+    if not seeds:
+        raise ValueError("at least one seed is required")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"seeds must be distinct, got {list(seeds)}")
+    return seeds
+
+
+def _replicate(base: RunConfig, seed: int) -> RunConfig:
+    """Return the base configuration set to one replicate seed.
+
+    Both seeds move together: ``train.seed`` for weights, batch order and
+    masking, ``subset_seed`` for the label-fraction draw and the SSL holdout.
+    See the module docstring for why the subset draw belongs inside the
+    replicate rather than being held fixed across it.
+
+    Args:
+        base: Base configuration.
+        seed: The replicate seed.
+
+    Returns:
+        A copy with both seeds set.
+    """
+    return base.with_(
+        train=base.train.__class__(**{**vars(base.train), "seed": seed}),
+        subset_seed=seed,
+    )
