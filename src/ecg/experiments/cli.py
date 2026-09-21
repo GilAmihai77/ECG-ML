@@ -81,6 +81,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument(
+        "--schedule-epochs",
+        type=int,
+        default=0,
+        help=(
+            "Epochs the cosine learning-rate decay spans; 0 means --epochs, "
+            "which is what every run before this flag existed did. Set it and "
+            "--epochs becomes a pure ceiling: '--schedule-epochs 50 --epochs "
+            "300 --patience 10' decays exactly as a 50-epoch run, then holds "
+            "at the floor until the run stops improving. Leave it at 0 and a "
+            "large --epochs stretches the decay instead of extending the run. "
+            "It is part of the optimiser, so give runs that use it a new "
+            "--variant rather than mixing them with runs that did not."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--d-model", type=int, default=256)
@@ -199,6 +214,7 @@ def base_config(args: argparse.Namespace) -> RunConfig:
         ),
         train=TrainConfig(
             epochs=args.epochs,
+            schedule_epochs=args.schedule_epochs,
             batch_size=args.batch_size,
             lr=args.lr,
             # Both seeds are overridden per replicate by the plan; the first is

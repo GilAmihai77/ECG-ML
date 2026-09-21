@@ -8,6 +8,7 @@ fail in any way at all without taking the training run with it.
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import warnings
 from pathlib import Path
@@ -319,6 +320,97 @@ class TestLoopHelpers:
         assert seen[-1] < seen[0]
         assert seen[-1] >= train.lr * train.min_lr_ratio * 0.99
         assert seen == sorted(seen, reverse=True)
+
+
+class TestScheduleSpan:
+    """``epochs`` used to be both the ceiling and the decay's time axis, so
+    raising it stretched the schedule instead of extending the run. These
+    check that separating them works and that leaving them joined is unchanged.
+    """
+
+    @staticmethod
+    def _rates(train: TrainConfig) -> list[float]:
+        model = build_classifier(ModelConfig(n_samples=200, d_model=32, n_heads=2))
+        optimiser, scheduler = build_optimiser(model, train)
+        seen = []
+        for _ in range(train.epochs):
+            seen.append(optimiser.param_groups[0]["lr"])
+            optimiser.step()
+            scheduler.step()
+        return seen
+
+    def test_the_default_is_the_old_schedule_exactly(self) -> None:
+        """Nothing already trained is invalidated by this field existing."""
+        joined = self._rates(TrainConfig(epochs=20))
+        explicit = self._rates(TrainConfig(epochs=20, schedule_epochs=20))
+        assert joined == pytest.approx(explicit)
+        # And the closed form the field replaced, recomputed here rather than
+        # imported, so a change to either side shows up as a failure.
+        train = TrainConfig(epochs=20)
+        expected = [
+            train.lr
+            * (
+                train.min_lr_ratio
+                + (1 - train.min_lr_ratio)
+                * 0.5
+                * (1 + math.cos(math.pi * epoch / (train.epochs - 1)))
+            )
+            for epoch in range(train.epochs)
+        ]
+        assert joined == pytest.approx(expected)
+
+    def test_a_short_span_decays_on_its_own_timetable(self) -> None:
+        """The point: the first 10 epochs of a 10-epoch decay are the same
+        whether the ceiling is 10 or 40."""
+        short = self._rates(TrainConfig(epochs=10, schedule_epochs=10))
+        capped = self._rates(TrainConfig(epochs=40, schedule_epochs=10))
+        assert capped[:10] == pytest.approx(short)
+
+    def test_past_the_span_it_holds_at_the_floor(self) -> None:
+        """Not riding the cosine back up toward the peak."""
+        rates = self._rates(TrainConfig(epochs=40, schedule_epochs=10))
+        floor = TrainConfig().lr * TrainConfig().min_lr_ratio
+        assert all(rate == pytest.approx(floor) for rate in rates[10:])
+
+    def test_a_long_ceiling_no_longer_stretches_the_decay(self) -> None:
+        """Without the field, epoch 20 of a 200-epoch budget sits near peak.
+        With it, the decay is finished and the run is free to keep going."""
+        stretched = self._rates(TrainConfig(epochs=200))
+        decoupled = self._rates(TrainConfig(epochs=200, schedule_epochs=50))
+        peak = TrainConfig().lr
+        # Barely moved: 98% of peak, which is the whole complaint.
+        assert stretched[20] > 0.95 * peak
+        # Well into its decay at the same epoch -- 64% of peak, cos(pi*20/49).
+        assert decoupled[20] < 0.7 * peak
+        assert decoupled[20] < 0.7 * stretched[20]
+        # And by epoch 60 the decay is done while the run is still free to go.
+        assert decoupled[60] == pytest.approx(peak * TrainConfig().min_lr_ratio)
+
+    def test_a_span_past_the_ceiling_is_rejected(self) -> None:
+        """It would put the end of the decay past the end of the run, which is
+        the problem this field exists to remove."""
+        with pytest.raises(ValueError, match="must not exceed"):
+            TrainConfig(epochs=10, schedule_epochs=20)
+
+    def test_a_negative_span_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must not be negative"):
+            TrainConfig(schedule_epochs=-1)
+
+    def test_it_round_trips_and_is_logged(self, config: RunConfig, tmp_path) -> None:
+        """Integrity rules 4 and 6: it changes the run, so it is part of it."""
+        changed = config.with_(
+            train=TrainConfig(epochs=40, schedule_epochs=10)
+        )
+        restored = RunConfig.from_yaml(changed.to_yaml(tmp_path / "config.yaml"))
+        assert restored.train.schedule_epochs == 10
+        assert changed.mlflow_params()["train.schedule_epochs"] == 10
+
+    def test_an_old_config_without_the_field_still_loads(
+        self, config: RunConfig
+    ) -> None:
+        payload = config.to_dict()
+        del payload["train"]["schedule_epochs"]
+        assert RunConfig.from_dict(payload).train.schedule_epochs == 0
 
 
 def _tracking_db(path: Path) -> Path:

@@ -39,6 +39,21 @@ class TrainConfig:
         weight_decay: AdamW decoupled weight decay.
         grad_clip: Global gradient-norm clip; ``0`` disables it.
         min_lr_ratio: Cosine floor as a fraction of ``lr``.
+        schedule_epochs: Epochs the cosine decay spans; ``0`` means ``epochs``.
+
+            Separating this from ``epochs`` is what lets ``epochs`` be a
+            ceiling rather than a time axis. Conflated -- which is what ``0``
+            asks for, and what every run before this existed did -- the decay
+            is stretched across the whole budget, so raising the budget slows
+            the decay rather than extending the run, and a run that stops early
+            never reaches its low-rate phase.
+
+            Set apart, the schedule finishes on its own timetable and the run
+            continues at ``min_lr_ratio`` for as long as it keeps improving:
+            ``schedule_epochs=50, epochs=300, patience=10`` decays exactly as a
+            50-epoch run does, then holds at the floor until the selection
+            metric stalls. Must not exceed ``epochs``, which would put the end
+            of the schedule past the end of the run and recreate the problem.
         seed: Seed for weights, shuffling and masks.
         amp: Use bfloat16 autocast on CUDA. Ignored on CPU. bf16 needs no
             gradient scaler, unlike fp16, so there is no scaler to misconfigure.
@@ -66,6 +81,7 @@ class TrainConfig:
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     min_lr_ratio: float = 0.01
+    schedule_epochs: int = 0
     seed: int = 0
     amp: bool = True
     device: str = "auto"
@@ -77,7 +93,8 @@ class TrainConfig:
 
         Raises:
             ValueError: If epochs, batch size or evaluation interval is not
-                positive, or the learning rate is not positive.
+                positive, the learning rate is not positive, or
+                ``schedule_epochs`` is negative or longer than ``epochs``.
         """
         if self.epochs < 1:
             raise ValueError(f"epochs must be positive, got {self.epochs}")
@@ -87,6 +104,19 @@ class TrainConfig:
             raise ValueError(f"eval_every must be positive, got {self.eval_every}")
         if self.lr <= 0:
             raise ValueError(f"lr must be positive, got {self.lr}")
+        if self.schedule_epochs < 0:
+            raise ValueError(
+                f"schedule_epochs must not be negative, got {self.schedule_epochs}"
+            )
+        if self.schedule_epochs > self.epochs:
+            # The exact failure this field exists to prevent, just spelled
+            # differently: the run would end before the decay did.
+            raise ValueError(
+                f"schedule_epochs ({self.schedule_epochs}) must not exceed "
+                f"epochs ({self.epochs}); the schedule would not finish before "
+                "the run ends, which is the stretched-cosine problem this "
+                "field exists to avoid. Raise epochs, or lower schedule_epochs."
+            )
 
 
 @dataclass(frozen=True)

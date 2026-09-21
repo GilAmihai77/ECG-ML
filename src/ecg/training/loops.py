@@ -99,6 +99,11 @@ def build_optimiser(
     dropping it removes a hyperparameter that would otherwise have to be held
     identical across four arms.
 
+    The cosine spans :attr:`~ecg.training.config.TrainConfig.schedule_epochs`,
+    falling back to ``epochs``. Past the end of that span the factor holds at
+    ``min_lr_ratio`` instead of the cosine turning back upward, so a run may
+    continue at the floor for as long as early stopping lets it.
+
     Args:
         model: Model to optimise.
         config: Optimisation budget.
@@ -123,11 +128,15 @@ def build_optimiser(
         lr=config.lr,
     )
 
+    span = config.schedule_epochs or config.epochs
+
     def factor(epoch: int) -> float:
-        """Cosine decay from 1.0 to ``min_lr_ratio`` over the run."""
-        if config.epochs <= 1:
+        """Cosine decay from 1.0 to ``min_lr_ratio`` over ``span`` epochs."""
+        if span <= 1:
             return 1.0
-        progress = epoch / (config.epochs - 1)
+        # Clamped: epochs beyond the span sit at the floor rather than riding
+        # the cosine back up toward the peak.
+        progress = min(epoch / (span - 1), 1.0)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return config.min_lr_ratio + (1.0 - config.min_lr_ratio) * cosine
 
@@ -487,17 +496,17 @@ def _warn_if_schedule_incomplete(
     """Warn when early stopping cut the cosine schedule short.
 
     The trap that makes "set a huge epoch budget and let patience decide" a
-    worse idea than it sounds. :func:`build_optimiser` spreads the cosine decay
-    across ``config.epochs``, so raising that number does not merely add a
-    ceiling -- it stretches the schedule. Stop at epoch 60 of 300 and the
-    learning rate is still near peak, so the weights never got the low-rate
-    phase where a transformer consolidates. The run does not fail; it quietly
-    returns a worse encoder than the same number of epochs under a budget that
-    matched.
+    worse idea than it sounds. The cosine decay is spread across
+    ``schedule_epochs``, so if that is left at ``0`` -- meaning ``epochs`` --
+    raising the budget does not merely add a ceiling, it stretches the
+    schedule. Stop at epoch 60 of 300 and the learning rate is still near peak,
+    so the weights never got the low-rate phase where a transformer
+    consolidates. The run does not fail; it quietly returns a worse encoder
+    than the same number of epochs under a budget that matched.
 
-    So set ``epochs`` to the length the schedule should span and treat patience
-    as the safety net for a run that has plainly stopped improving, rather than
-    as the normal way a run ends.
+    Setting ``schedule_epochs`` is the fix, and this warning is what is left
+    over once it exists: it now only fires when a run stopped *inside* its
+    decay, which is worth knowing however the two numbers were set.
 
     Args:
         optimiser: The optimiser, read for its current learning rate.
@@ -507,13 +516,21 @@ def _warn_if_schedule_incomplete(
     final = float(optimiser.param_groups[0]["lr"])
     if config.lr <= 0 or final <= _ANNEALED_BELOW * config.lr:
         return
+    span = config.schedule_epochs or config.epochs
+    remedy = (
+        f"Lower schedule_epochs below {epoch + 1}, or raise patience."
+        if config.schedule_epochs
+        else (
+            "Set schedule_epochs to about the length runs actually take, which "
+            "decouples the decay from the ceiling, or lower epochs to match."
+        )
+    )
     warnings.warn(
-        f"early stop at epoch {epoch + 1} of a {config.epochs}-epoch budget, "
-        f"with the learning rate still at {final / config.lr:.0%} of peak. The "
-        "cosine schedule is spread over the full budget, so this run never "
-        "reached its low-rate phase and is not equivalent to one trained with "
-        f"epochs={epoch + 1}. Lower epochs to roughly the length runs actually "
-        "take, and keep patience as the safety net rather than the usual exit.",
+        f"early stop at epoch {epoch + 1} of a {span}-epoch decay "
+        f"(budget {config.epochs}), with the learning rate still at "
+        f"{final / config.lr:.0%} of peak. This run never reached its low-rate "
+        f"phase, so it is not equivalent to one trained with a {epoch + 1}"
+        f"-epoch schedule. {remedy}",
         RuntimeWarning,
         stacklevel=2,
     )
