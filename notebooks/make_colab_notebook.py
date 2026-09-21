@@ -1,7 +1,7 @@
 """Generate the Colab runner notebook.
 
 **This script is a scaffold, not the source of truth.** The notebook it writes
-has since been edited directly -- the research summary in section 12 exists
+has since been edited directly -- the research summary in section 13 exists
 only there -- so regenerating would delete that work. The guard below refuses
 to overwrite a notebook that has grown more cells than this script produces.
 Edit the notebook, not this file, unless you are rebuilding it from scratch.
@@ -68,16 +68,24 @@ and every later `ecg-run` in the session reads from local disk instead.
 
 ## The order to run in
 
+Three of these choose a setting on validation before the study spends real
+money on it. Each writes its answer into **cell 2**, which holds every knob;
+re-run cell 2 after each one rather than editing the command below it.
+
 1. **Cells 1-4** — setup and checks. Fast.
-2. **Cell 5, the dry run** — prints the 70-run grid without booking anything.
-   Read it. This is the cheapest place to catch a wrong fraction, and the only
-   place the seed count is free to change.
-3. **Cell 6, the timing probe** — one epoch, to turn "about 3 hours" into a
-   real number before you commit to the full study.
-4. **Cell 7, the mask-ratio ablation** — 3 pretrains + 3 short fine-tunes,
-   selected on validation. Pick the winner and pass it to cell 8.
-5. **Cell 8, the study** — the 70 runs.
-6. **Cells 9-10** — results.
+2. **Cell 5, the dry run** — prints the grid and its total epoch count
+   without booking anything. Read it. This is the cheapest place to catch a
+   wrong fraction, and the only place the budget is free to change.
+3. **Cell 6, the timing probe** — one epoch of each kind, turned into an
+   hours estimate by the cell after it. Do this before committing to a long
+   `SSL_EPOCHS`; it is the difference between a plan and a hope.
+4. **Section 7, the mask-ratio ablation** — 3 pretrains + 3 short
+   fine-tunes, selected on validation. Sets `MASK_RATIO`.
+5. **Section 8, the pretraining budget** — fine-tunes from encoders of
+   different ages, because held-out reconstruction loss cannot tell you when to
+   stop. Sets `SSL_EPOCHS`. The study multiplies this number by ten.
+6. **Section 9, the study** — the 70 runs.
+7. **Sections 10-13** — results, curves and the write-up tables.
 
 ## Five seeds, and what that costs
 
@@ -89,12 +97,28 @@ labelled records the fraction draws — the last one because "if I had a
 different 20% of the labels" is the question a label-scarcity study is actually
 asking.
 
-**This is five times the GPU.** 70 runs, not 14: size it with cell 6 before you
-start, and expect more than one Colab session. That is survivable only because
-resume is per run — see below — so plan on re-running cell 8 until it stops
-finding work. If you are short of time, `--seeds 0 1 2` is a defensible three
-replicates; `--share-pretraining` is the other lever, and cell 8 says what it
-costs you.
+**This is five times the GPU**, and `SSL_EPOCHS` multiplies the pretraining
+half of it again. 70 runs, not 14: size it with cell 6 before you start, and
+expect more than one Colab session. That is survivable only because resume is
+per run — see below — so plan on re-running the study cell until it stops
+finding work. If you are short of time, `SEEDS = "0 1 2"` is a defensible three
+replicates; `--share-pretraining` is the other lever, and the study cell says
+what it costs you. Prefer three honest seeds to five that share an encoder.
+
+## Two budgets, not one
+
+`EPOCHS` is the fine-tuning budget and `SSL_EPOCHS` the pretraining one, and
+they are meant to differ by an order of magnitude: 50 epochs is 3,250 SSL steps
+at batch 256, which is very few for masked reconstruction, while 50 epochs of
+fine-tuning on 10,254 labelled records is already generous. They used to be one
+number, so raising it for pretraining also bought long fine-tunes — and those
+are 60 of the 70 runs.
+
+One consequence worth knowing: the learning-rate decay spans the budget rather
+than being capped by it, so raising a budget stretches the schedule instead of
+extending the run. Set each budget to the length you intend, and leave
+`--patience` as a safety net rather than the usual way a run ends. Both loops
+warn if a run stops before its decay finished.
 
 ## If Colab disconnects
 
@@ -170,9 +194,36 @@ METADATA = LOCAL / "ptbxl"
 # re-runs the whole study under new names.
 SEEDS = "0 1 2 3 4"
 
+# Which version of the architecture this session is running. Change it whenever
+# you change the model -- see section 9. A slug, no spaces: it becomes part of
+# every run name and every output directory.
+VARIANT = "base"
+
+# Masking ratio, chosen in section 7. Set it from that table and re-run this
+# cell before the study.
+MASK_RATIO = 0.5
+
+# Pretraining epochs, chosen in section 8. Separate from EPOCHS because the two
+# stages want budgets an order of magnitude apart: 50 epochs is only 3,250 SSL
+# steps at batch 256, while 50 epochs of fine-tuning on 10,254 labelled records
+# is already plenty. 0 would mean "same as EPOCHS", which is what every run
+# before this setting existed did.
+SSL_EPOCHS = 200
+EPOCHS = 50
+
+# Drive writes per run, throttled. pretrain_last.pt is 41.7 MB with its
+# optimiser state and pretrain_best.pt 13.9 MB, and SSL reconstruction loss
+# improves on nearly every epoch -- so at every-epoch writing a 600-epoch run
+# sends 33 GB to Drive for 600 epochs of 65 steps. The best weights are kept in
+# memory and always flushed when a run ends, so this risks losing at most this
+# many epochs of progress to a disconnect, never the selected encoder.
+CHECKPOINT_EVERY = 10
+
 print(f"drive:  {ECG}")
 print(f"local:  {LOCAL}")
-print(f"seeds:  {SEEDS}")
+print(f"variant: {VARIANT}")
+print(f"seeds:   {SEEDS}")
+print(f"mask:    {MASK_RATIO}   ssl epochs: {SSL_EPOCHS}   epochs: {EPOCHS}")
 """
 )
 
@@ -270,8 +321,12 @@ code(
     """
 !ecg-run --dry-run \\
     --store "$STORE" --metadata "$METADATA" --output "$RUNS/study" \\
+    --variant $VARIANT \\
+    --mask-ratio $MASK_RATIO --mask-span 2 \\
     --fractions 0.2 0.5 1.0 --seeds $SEEDS \\
-    --epochs 50 --d-model 256 --n-heads 8
+    --epochs $EPOCHS --ssl-epochs $SSL_EPOCHS \\
+    --checkpoint-every $CHECKPOINT_EVERY \\
+    --batch-size 256 --d-model 256 --n-layers 4 --n-heads 8
 """
 )
 
@@ -279,12 +334,16 @@ md(
     """
 ## 6. Timing probe
 
-One epoch of each kind, so the full study's cost is a measurement rather than a
-guess. It writes to a throwaway directory, so it does not pollute the real
-results or the resume state.
+One epoch of each kind, so the study's cost is a measurement rather than a
+guess. It writes to a throwaway directory, so it pollutes neither the real
+results nor the resume state.
 
-Multiply what you see by `--epochs` **and by the number of seeds** to size
-the study. The probe runs one seed; the study runs five.
+`--seeds 0` matters here: without it the probe runs the whole five-seed grid,
+70 runs instead of 14, to measure something one seed already tells you.
+
+The next cell turns the probe into an estimate. It has to, now that pretraining
+and fine-tuning have separate budgets -- a run count no longer implies a cost,
+and the two stages differ in both epoch length and epoch count.
 """
 )
 
@@ -296,7 +355,7 @@ start = time.perf_counter()
 !ecg-run \\
     --store "$STORE" --metadata "$METADATA" \\
     --output /content/timing --tracking /content/timing/mlflow.db \\
-    --epochs 1 --fractions 1.0 --no-track
+    --epochs 1 --ssl-epochs 1 --fractions 1.0 --seeds 0 --no-track
 print(f"\\nprobe wall clock: {(time.perf_counter() - start) / 60:.1f} min")
 """
 )
@@ -305,17 +364,39 @@ md(
     """
 ### Reading the probe
 
-The probe ran 2 pretraining epochs and 4 supervised epochs at 100% labels.
-For a study with `E` epochs:
+`minutes` in the probe's `results.csv` is a one-epoch run, so it *is* the
+per-epoch cost of each stage. The estimate below scales that up.
 
-- pretraining is `2 x E` epochs
-- the supervised grid is `E x (0.2 + 0.2 + 0.5 + 0.5 + 1.0 + 1.0) x 2 embedders`
-  = `6.8 x E` supervised-epoch-equivalents at full size
+Supervised cost scales with the label fraction, and the probe measured at 100%,
+so the grid is counted as `sum(fractions) x 2 embedders x 2 origins` full-size
+epoch-equivalents -- `1.7 x 4 = 6.8` at the default fractions.
 
-so the study costs roughly `2 x E` pretraining epochs plus `6.8 x E` fine-tuning
-epochs. At 50 epochs that is 100 pretraining epochs and ~340 fine-tuning
-epoch-equivalents. If the probe says a pretraining epoch takes 40 s, budget
-about 70 minutes for pretraining alone.
+Treat it as a floor. Drive writes, evaluation passes and Colab's own overhead
+all sit on top, and the ceiling ignores early stopping.
+"""
+)
+
+code(
+    """
+import pandas as pd
+
+probe = pd.read_csv("/content/timing/results.csv")
+per_epoch = probe.groupby("kind")["minutes"].mean()
+n_seeds = len(SEEDS.split())
+fractions = [0.2, 0.5, 1.0]
+
+# 2 embedders x seeds pretraining runs; the supervised grid is every fraction
+# times both embedders times scratch/ssl.
+ssl_minutes = per_epoch["pretrain"] * SSL_EPOCHS * 2 * n_seeds
+sup_minutes = per_epoch["supervised"] * EPOCHS * sum(fractions) * 4 * n_seeds
+
+print(f"per pretraining epoch : {per_epoch['pretrain'] * 60:6.1f} s")
+print(f"per supervised epoch  : {per_epoch['supervised'] * 60:6.1f} s  (at 100% labels)")
+print()
+print(f"pretraining : {2 * n_seeds:>3} runs x {SSL_EPOCHS:>4} epochs = {ssl_minutes / 60:6.1f} h")
+print(f"fine-tuning : {12 * n_seeds:>3} runs x {EPOCHS:>4} epochs = {sup_minutes / 60:6.1f} h")
+print(f"study total :                       {(ssl_minutes + sup_minutes) / 60:6.1f} h")
+print("\\nA floor, and a ceiling: overhead is extra, early stopping is not counted.")
 """
 )
 
@@ -327,9 +408,13 @@ Three pretraining runs at ratios 0.3 / 0.5 / 0.7, each fine-tuned at the
 smallest label fraction -- where SSL's effect is largest and the runs are
 cheapest. **Selection is on validation.**
 
-Run this before the study, and pass the winning ratio to cell 8. Use the same
-ratio for every arm: tuning the mask per arm would fold the SSL setup into what
-is being compared.
+Run this before the study, set `MASK_RATIO` in cell 2 from the winner and
+re-run that cell. Use the same ratio for every arm: tuning the mask per arm
+would fold the SSL setup into what is being compared.
+
+It runs at 30 epochs, not at `SSL_EPOCHS`. That keeps the selection cheap, at
+the cost of an approximation worth stating in the write-up: the best ratio can
+shift with budget, since a longer run has more chance to exploit a harder mask.
 """
 )
 
@@ -370,10 +455,80 @@ print(
 
 md(
     """
-## 8. The study
+## 8. How long should pretraining run?
+
+The study multiplies this number by ten -- two embedders times five seeds -- so
+it is worth an hour to get right.
+
+**Held-out reconstruction loss will not answer it.** On 17,418 records it keeps
+falling long after the representation has stopped becoming more useful, which
+is why `pretrain_best.pt` in a long run is essentially its last epoch. The only
+honest signal is downstream: fine-tune from encoders of different ages and
+compare on validation.
+
+Two modes, and they answer different questions:
+
+- **default** -- one properly annealed pretraining run per budget, costing
+  `sum(budgets)` epochs. Every rung is a run you could really ship, so this is
+  the comparison that belongs in the write-up.
+- **`--from-snapshots`** -- one run at the longest budget, snapshotted as it
+  goes, costing `max(budgets)`. Roughly half. But the short rungs are taken
+  mid-anneal with the learning rate still near peak, so they understate what a
+  real run of that length reaches. It shows where the curve flattens; it does
+  not tell you what a 200-epoch run is worth.
+
+Set `SSL_EPOCHS` in cell 2 from the winner and re-run that cell.
+"""
+)
+
+code(
+    """
+# 1,300 epochs at these budgets: 100 + 200 + 400 + 600. Add --from-snapshots
+# to pay 600 instead, with the caveat above. --seeds 0 because this selects a
+# setting on validation rather than reporting a result -- it is also the CLI
+# default for a selection plan.
+!ecg-run --plan ssl-budget \\
+    --store "$STORE" --metadata "$METADATA" \\
+    --output "$RUNS/ssl_budget" --tracking /content/mlruns/mlflow.db \\
+    --experiment ecg-ssl-budget --variant $VARIANT \\
+    --mask-ratio $MASK_RATIO --mask-span 2 \\
+    --ssl-budgets 100 200 400 600 \\
+    --fractions 0.2 --epochs $EPOCHS \\
+    --checkpoint-every $CHECKPOINT_EVERY --seeds 0 \\
+    --batch-size 256 --d-model 256 --n-layers 4 --n-heads 8
+"""
+)
+
+code(
+    """
+# The budgets are zero-padded in the run names (e0100, e0200, ...), so sorting
+# by name sorts by budget -- which is why they are padded.
+ladder = load_results(RUNS / "ssl_budget")
+table = (
+    ladder[(ladder["kind"] == "supervised") & (ladder["variant"] == VARIANT)]
+    .sort_values("run")
+    .loc[:, ["run", "n_train", "val_macro_auroc", "test_macro_auroc"]]
+)
+print(table.to_string(index=False))
+
+if not table.empty:
+    best = table.loc[table["val_macro_auroc"].idxmax()]
+    print(f"\\nbest on val: {best['run']}  ({best['val_macro_auroc']:.4f})")
+    print(
+        "Look at the shape, not only the argmax. If the last two rungs are "
+        "within noise\\nof each other, take the cheaper one -- the study pays "
+        "for this budget ten times over."
+    )
+"""
+)
+
+md(
+    """
+## 9. The study
 
 Fourteen runs: two pretraining runs, then four arms at each of three label
-fractions. **Set `MASK_RATIO` to whatever cell 7 selected.**
+fractions. **`MASK_RATIO` and `SSL_EPOCHS` come from cell 2**, set there from what
+sections 7 and 8 selected.
 
 Safe to re-run after a disconnect -- finished runs are skipped.
 
@@ -413,31 +568,30 @@ means the results on screen are the old model's.
 
 code(
     """
-MASK_RATIO = 0.5       # <- from cell 7
-VARIANT = "base"       # <- change whenever you change the model
-
-# 14 runs per seed, so 70 at the default SEEDS (set in cell 2). Re-run this
-# cell after a disconnect; finished runs are skipped. Widening SEEDS later
-# re-runs only the seeds you added, as long as you did not start from one.
-# --share-pretraining would cut it to 62 by pretraining once per embedder
-# instead of once per seed, but then the SSL arm's error bar omits
-# pretraining variance and is narrower than the scratch arm's for a reason
-# that has nothing to do with SSL. Only worth it if you are out of hours,
-# and it has to be said in the write-up.
-
+# Everything below comes from cell 2: re-run that cell after each selection
+# step rather than editing here. Re-run this cell after a disconnect too;
+# finished runs are skipped.
+#
+# --share-pretraining would pretrain once per embedder instead of once per
+# seed. At a long SSL_EPOCHS that is the biggest lever there is -- but it gives
+# the SSL arm an error bar that omits pretraining variance, so it comes out
+# narrower than the scratch arm's for a reason unrelated to SSL. Prefer fewer
+# seeds with honest pretraining: SEEDS = "0 1 2" costs less and claims less.
 !ecg-run \\
     --store "$STORE" --metadata "$METADATA" \\
     --output "$RUNS/study" --tracking /content/mlruns/mlflow.db \\
     --experiment ecg-ssl --variant $VARIANT \\
     --mask-ratio $MASK_RATIO --mask-span 2 \\
     --fractions 0.2 0.5 1.0 --seeds $SEEDS \\
-    --epochs 50 --batch-size 256 --d-model 256 --n-layers 4 --n-heads 8
+    --epochs $EPOCHS --ssl-epochs $SSL_EPOCHS \\
+    --checkpoint-every $CHECKPOINT_EVERY \\
+    --batch-size 256 --d-model 256 --n-layers 4 --n-heads 8
 """
 )
 
 md(
     """
-## 9. Results
+## 10. Results
 
 `load_results` rather than `results.csv`: the CSV holds only the plan that last
 ran, so a second variant's study overwrites the first's summary. The per-run
@@ -489,12 +643,12 @@ print(embedder_benefit(frame).to_string())
 
 md(
     """
-## 10. The label-efficiency curve
+## 11. The label-efficiency curve
 
 The study's headline figure: does the SSL gap widen as labels get scarcer?
 
 **One architecture per figure.** The four arms are only comparable within a
-variant, so the cell plots `VARIANT` from cell 8; change it and re-run to see
+variant, so the cell plots `VARIANT` from cell 2; change it and re-run to see
 another. Overlaying two architectures here would put eight lines on two panels
 and make the SSL gap — the thing the figure exists to show — the hardest thing
 on it to see.
@@ -545,7 +699,7 @@ plt.show()
 
 md(
     """
-## 11. Browsing the MLflow runs
+## 12. Browsing the MLflow runs
 
 The database is at `/content/mlruns/mlflow.db` with a per-epoch copy in each
 run's output directory on Drive. To browse it locally, download the copy from
