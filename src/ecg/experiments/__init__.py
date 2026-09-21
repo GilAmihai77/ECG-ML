@@ -9,12 +9,15 @@ from one base configuration.
 from __future__ import annotations
 
 from ecg.experiments.plan import (
+    DEFAULT_SSL_BUDGETS,
     RunSpec,
     ablation_plan,
     describe_plan,
     experiment_plan,
+    budget_name,
     pretrain_name,
     seed_name,
+    ssl_budget_plan,
     supervised_name,
     variant_name,
 )
@@ -49,12 +52,14 @@ from ecg.experiments.runner import (
 )
 
 __all__ = [
+    "DEFAULT_SSL_BUDGETS",
     "RunOutcome",
     "RunPredictions",
     "RunSpec",
     "Workspace",
     "ablation_plan",
     "aggregate_runs",
+    "budget_name",
     "collect_predictions",
     "comparison_table",
     "describe_plan",
@@ -78,6 +83,7 @@ __all__ = [
     "seed_name",
     "select_seed",
     "ssl_benefit",
+    "ssl_budget_plan",
     "style_table",
     "supervised_name",
     "training_history",

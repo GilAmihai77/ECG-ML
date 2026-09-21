@@ -413,6 +413,72 @@ class TestScheduleSpan:
         assert RunConfig.from_dict(payload).train.schedule_epochs == 0
 
 
+class TestPretrainingBudget:
+    """Pretraining and fine-tuning want budgets an order of magnitude apart.
+    One number used to set both, so a long SSL budget also bought long
+    fine-tunes -- and those are 60 of the study's 70 runs."""
+
+    def test_unset_leaves_the_budget_alone(self) -> None:
+        train = TrainConfig(epochs=50)
+        assert train.for_pretraining() is train
+
+    def test_it_substitutes_only_the_two_epoch_counts(self) -> None:
+        train = TrainConfig(epochs=50, ssl_epochs=600, lr=1e-3, patience=7)
+        ssl = train.for_pretraining()
+        assert (ssl.epochs, train.epochs) == (600, 50)
+        # Everything that must stay identical across arms is untouched.
+        assert (ssl.lr, ssl.patience, ssl.seed, ssl.batch_size) == (
+            train.lr, train.patience, train.seed, train.batch_size
+        )
+
+    def test_the_ssl_schedule_defaults_to_the_ssl_budget(self) -> None:
+        """Not to --epochs, which would stretch or truncate the decay."""
+        ssl = TrainConfig(epochs=50, ssl_epochs=600).for_pretraining()
+        assert ssl.schedule_epochs == 0  # 0 means "span epochs", now 600
+        model = build_classifier(ModelConfig(n_samples=200, d_model=32, n_heads=2))
+        _, scheduler = build_optimiser(model, ssl)
+        assert scheduler.lr_lambdas[0](599) == pytest.approx(ssl.min_lr_ratio)
+        assert scheduler.lr_lambdas[0](300) > ssl.min_lr_ratio
+
+    def test_an_explicit_ssl_schedule_is_carried_over(self) -> None:
+        ssl = TrainConfig(
+            epochs=50, ssl_epochs=600, ssl_schedule_epochs=400
+        ).for_pretraining()
+        assert (ssl.epochs, ssl.schedule_epochs) == (600, 400)
+
+    def test_a_schedule_past_the_ssl_budget_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="pretraining budget"):
+            TrainConfig(epochs=50, ssl_epochs=100, ssl_schedule_epochs=200)
+
+    def test_negative_budgets_are_rejected(self) -> None:
+        with pytest.raises(ValueError, match="ssl_epochs must not be negative"):
+            TrainConfig(ssl_epochs=-1)
+        with pytest.raises(ValueError, match="checkpoint_every must be positive"):
+            TrainConfig(checkpoint_every=0)
+        with pytest.raises(ValueError, match="snapshot_every must not be negative"):
+            TrainConfig(snapshot_every=-1)
+
+    def test_the_new_fields_round_trip_and_are_logged(self, config, tmp_path) -> None:
+        changed = config.with_(
+            train=TrainConfig(
+                epochs=50, ssl_epochs=600, checkpoint_every=10, snapshot_every=100
+            )
+        )
+        restored = RunConfig.from_yaml(changed.to_yaml(tmp_path / "config.yaml"))
+        assert restored.train.ssl_epochs == 600
+        assert restored.train.checkpoint_every == 10
+        params = changed.mlflow_params()
+        assert params["train.ssl_epochs"] == 600
+        assert params["train.snapshot_every"] == 100
+
+    def test_an_old_config_without_them_still_loads(self, config: RunConfig) -> None:
+        payload = config.to_dict()
+        for field in ("ssl_epochs", "ssl_schedule_epochs", "checkpoint_every"):
+            del payload["train"][field]
+        restored = RunConfig.from_dict(payload).train
+        assert (restored.ssl_epochs, restored.checkpoint_every) == (0, 1)
+
+
 def _tracking_db(path: Path) -> Path:
     """A small SQLite file standing in for the MLflow tracking database."""
     path.parent.mkdir(parents=True, exist_ok=True)

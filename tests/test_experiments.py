@@ -31,6 +31,7 @@ from ecg.experiments.plan import (
     experiment_plan,
     pretrain_name,
     seed_name,
+    ssl_budget_plan,
     supervised_name,
     variant_name,
 )
@@ -49,7 +50,7 @@ from ecg.experiments.runner import (
     run_plan,
     ssl_benefit,
 )
-from ecg.training.loops import resolve_device
+from ecg.training.loops import resolve_device, snapshot_name
 from ecg.models.config import ModelConfig, SslConfig
 from ecg.training.config import DEFAULT_VARIANT, RunConfig, TrainConfig
 from ecg.training.tracking import UNKNOWN, git_provenance
@@ -293,6 +294,94 @@ class TestAblationPlan:
                 )
 
 
+class TestSslBudgetPlan:
+    """How long is pretraining worth running, asked before the study
+    multiplies that number by ten."""
+
+    def test_one_annealed_pretrain_per_budget(self, base: RunConfig) -> None:
+        specs = ssl_budget_plan(base, budgets=(100, 200, 400))
+        pretrains = [s for s in specs if s.kind == "pretrain"]
+        assert len(specs) == 6
+        assert [s.config.train.for_pretraining().epochs for s in pretrains] == [
+            100, 200, 400
+        ]
+        # Each rung anneals over its own budget: 0 means "span the budget".
+        assert {s.config.train.ssl_schedule_epochs for s in pretrains} == {0}
+
+    def test_the_fine_tunes_keep_the_supervised_budget(self, base: RunConfig) -> None:
+        """The SSL budget must not leak into the fine-tune, which is the whole
+        reason ssl_epochs exists."""
+        specs = ssl_budget_plan(base, budgets=(100, 400))
+        for spec in specs:
+            if spec.kind == "supervised":
+                assert spec.config.train.epochs == base.train.epochs
+
+    def test_each_fine_tune_follows_its_own_pretrain(self, base: RunConfig) -> None:
+        by_name = {s.name: s for s in ssl_budget_plan(base, budgets=(100, 200))}
+        for spec in by_name.values():
+            if spec.depends_on:
+                source = by_name[spec.depends_on]
+                assert source.kind == "pretrain"
+                assert spec.name.startswith(source.name)
+
+    def test_snapshot_mode_pretrains_once(self, base: RunConfig) -> None:
+        specs = ssl_budget_plan(
+            base, budgets=(100, 200, 400, 600), from_snapshots=True
+        )
+        pretrains = [s for s in specs if s.kind == "pretrain"]
+        assert len(pretrains) == 1
+        assert pretrains[0].config.train.for_pretraining().epochs == 600
+        assert len([s for s in specs if s.kind == "supervised"]) == 4
+
+    def test_snapshot_mode_names_the_file_each_rung_loads(
+        self, base: RunConfig
+    ) -> None:
+        specs = ssl_budget_plan(base, budgets=(100, 400), from_snapshots=True)
+        loaded = [s.checkpoint_name for s in specs if s.kind == "supervised"]
+        assert loaded == [snapshot_name(100), snapshot_name(400)]
+
+    def test_snapshots_land_on_every_rung(self, base: RunConfig) -> None:
+        """A period that missed a budget would leave that fine-tune with no
+        checkpoint to load, discovered only after the pretraining had run."""
+        for budgets in ((100, 200, 400, 600), (150, 450), (7, 13)):
+            specs = ssl_budget_plan(base, budgets=budgets, from_snapshots=True)
+            every = specs[0].config.train.snapshot_every
+            assert every > 0
+            assert all(rung % every == 0 for rung in budgets)
+
+    def test_separate_runs_cost_more_than_snapshots(self, base: RunConfig) -> None:
+        """The trade the flag exists to make."""
+        def ssl_epochs(specs):
+            return sum(
+                s.config.train.for_pretraining().epochs
+                for s in specs
+                if s.kind == "pretrain"
+            )
+
+        budgets = (100, 200, 400, 600)
+        assert ssl_epochs(ssl_budget_plan(base, budgets=budgets)) == 1300
+        assert ssl_epochs(
+            ssl_budget_plan(base, budgets=budgets, from_snapshots=True)
+        ) == 600
+
+    def test_names_are_unique_across_seeds(self, base: RunConfig) -> None:
+        for snapshots in (False, True):
+            specs = ssl_budget_plan(
+                base, budgets=(100, 200), seeds=(0, 1), from_snapshots=snapshots
+            )
+            assert len({s.name for s in specs}) == len(specs)
+
+    def test_it_is_prefixed_by_the_variant(self, base: RunConfig) -> None:
+        specs = ssl_budget_plan(base.with_(variant="deep6"), budgets=(100,))
+        assert all(s.name.startswith("deep6-") for s in specs)
+
+    def test_bad_budgets_are_rejected(self, base: RunConfig) -> None:
+        with pytest.raises(ValueError, match="at least one budget"):
+            ssl_budget_plan(base, budgets=())
+        with pytest.raises(ValueError, match="budgets must be positive"):
+            ssl_budget_plan(base, budgets=(0, 100))
+
+
 class TestRunner:
     def test_single_supervised_run(self, base, workspace, tmp_path) -> None:
         spec = RunSpec("sup", "supervised", base.with_(name="sup", label_fraction=1.0))
@@ -391,6 +480,64 @@ class TestRunner:
         )
         assert Path(outcome.checkpoint).name == "best.pt"
         assert outcome.best_epoch <= outcome.epochs_run
+
+
+class TestSeededInitialisation:
+    """Weight initialisation draws from the global generator, and the loops
+    seed only after their caller has already built the model. Left alone, a
+    run's weights depended on how much randomness every earlier run in the
+    plan consumed -- so a run was not reproducible from its own config, and
+    two arms at one seed did not in fact start from comparable places."""
+
+    def test_a_run_ignores_the_ambient_generator(
+        self, base, workspace, tmp_path
+    ) -> None:
+        spec = RunSpec("sup", "supervised", base.with_(name="sup"))
+        torch.manual_seed(0)
+        first = run_one(
+            spec, workspace, output_root=tmp_path / "a", track=False, progress=False
+        )
+        # Stand in for other runs having executed in between.
+        torch.randn(5000)
+        second = run_one(
+            spec, workspace, output_root=tmp_path / "b", track=False, progress=False
+        )
+        assert first.metrics == pytest.approx(second.metrics)
+
+    def test_pretraining_is_seeded_the_same_way(self, base, workspace, tmp_path) -> None:
+        spec = RunSpec("pre", "pretrain", base.with_(name="pre"))
+        torch.manual_seed(0)
+        first = run_one(
+            spec, workspace, output_root=tmp_path / "a", track=False, progress=False
+        )
+        torch.randn(5000)
+        second = run_one(
+            spec, workspace, output_root=tmp_path / "b", track=False, progress=False
+        )
+        assert first.metrics == pytest.approx(second.metrics)
+
+    def test_different_seeds_still_differ(self, base, workspace, tmp_path) -> None:
+        """The fix must not collapse the replicates into one another."""
+        outcomes = [
+            run_one(
+                RunSpec("sup", "supervised", _replicated(base, seed)),
+                workspace,
+                output_root=tmp_path / f"s{seed}",
+                track=False,
+                progress=False,
+            )
+            for seed in (0, 1)
+        ]
+        assert outcomes[0].metrics != pytest.approx(outcomes[1].metrics)
+
+
+def _replicated(base: RunConfig, seed: int) -> RunConfig:
+    """The base config at one replicate seed, as the plan builds it."""
+    return base.with_(
+        name="sup",
+        train=TrainConfig(**{**vars(base.train), "seed": seed}),
+        subset_seed=seed,
+    )
 
 
 class TestVariant:

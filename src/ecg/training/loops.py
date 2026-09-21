@@ -19,6 +19,7 @@ import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -34,6 +35,55 @@ from ecg.training.tracking import Tracker
 
 #: Metric that selects the best supervised checkpoint. Validation only.
 SELECTION_METRIC: str = "val_macro_auroc"
+
+
+def snapshot_name(completed_epochs: int) -> str:
+    """Filename of the pretraining snapshot taken after N completed epochs.
+
+    Zero-padded so a directory listing sorts in training order, and shared with
+    :func:`ecg.experiments.plan.ssl_budget_plan`, which has to name the file a
+    fine-tune should load without having seen the run.
+
+    Args:
+        completed_epochs: Epochs finished, one-based.
+
+    Returns:
+        A name like ``"pretrain_epoch0200.pt"``.
+    """
+    return f"pretrain_epoch{completed_epochs:04d}.pt"
+
+
+def _due(epoch: int, every: int) -> bool:
+    """Whether a periodic action falls on this zero-based epoch.
+
+    Args:
+        epoch: Zero-based epoch that has just finished.
+        every: Period in epochs; ``0`` disables the action entirely.
+
+    Returns:
+        ``True`` when the action should run.
+    """
+    return bool(every) and (epoch + 1) % every == 0
+
+
+def _capture(model: nn.Module) -> dict[str, Any]:
+    """A detached CPU copy of a model's weights.
+
+    Holding the best weights in memory is what lets ``checkpoint_every`` skip
+    Drive writes without risking the checkpoint: by the time a later epoch
+    flushes, the model has trained on, so its current ``state_dict`` is no
+    longer the state that was selected.
+
+    Args:
+        model: Model to copy.
+
+    Returns:
+        A state dict safe to keep across further training.
+    """
+    return {
+        key: value.detach().to("cpu", copy=True) if torch.is_tensor(value) else value
+        for key, value in model.state_dict().items()
+    }
 
 
 @dataclass
@@ -76,6 +126,16 @@ def resolve_device(requested: str) -> torch.device:
 
 def set_seed(seed: int) -> None:
     """Seed every generator the loops draw from (integrity rule 4).
+
+    **Call this before building the model, not only inside the loop.** Both
+    loops receive a model their caller already constructed, so the ``set_seed``
+    they run cannot govern its initialisation -- by then the weights are drawn.
+    Left to the ambient generator, a run's initialisation depends on how much
+    randomness every earlier run in the plan happened to consume, which makes
+    it unreproducible from its own config and breaks the premise that two arms
+    at one seed differ only in the embedder.
+    :func:`ecg.experiments.runner.run_one` seeds before it builds; a direct
+    caller of these loops must do the same.
 
     Args:
         seed: The run seed.
@@ -220,16 +280,22 @@ def pretrain(
             while the cosine schedule was still near peak learning rate -- see
             :func:`_warn_if_schedule_incomplete`.
     """
-    device = resolve_device(config.train.device)
+    # The pretraining budget, which is allowed to be an order of magnitude
+    # longer than the fine-tuning one. Everything else in it is shared.
+    train = config.train.for_pretraining()
+    device = resolve_device(train.device)
     model.to(device)
-    set_seed(config.train.seed)
-    optimiser, scheduler = build_optimiser(model, config.train)
-    generator = torch.Generator().manual_seed(config.train.seed)
+    set_seed(train.seed)
+    optimiser, scheduler = build_optimiser(model, train)
+    generator = torch.Generator().manual_seed(train.seed)
     output = Path(config.output_dir)
     result = TrainingResult()
     stale = 0
-    stopping = bool(config.train.patience) and holdout is not None
-    if config.train.patience and holdout is None:
+    best_state: dict[str, Any] | None = None
+    best_record: dict[str, float] = {}
+    best_dirty = False
+    stopping = bool(train.patience) and holdout is not None
+    if train.patience and holdout is None:
         warnings.warn(
             "patience is set but this pretraining run has no holdout "
             "(ssl_holdout=0), so early stopping is disabled: the only "
@@ -241,15 +307,15 @@ def pretrain(
         )
     started = time.perf_counter()
 
-    for epoch in range(config.train.epochs):
+    for epoch in range(train.epochs):
         model.train()
         totals: dict[str, float] = {}
         for signal, _ in batches:
-            with autocast_context(device, config.train.amp):
+            with autocast_context(device, train.amp):
                 step = model.step(signal, generator=generator)
             optimiser.zero_grad(set_to_none=True)
             step.loss.backward()
-            _clip(model, config.train.grad_clip)
+            _clip(model, train.grad_clip)
             optimiser.step()
             for key, value in step.metrics.items():
                 totals[key] = totals.get(key, 0.0) + value
@@ -268,7 +334,7 @@ def pretrain(
             tracker.log_metrics(record, step=epoch)
         if progress:
             print(
-                f"  epoch {epoch + 1:3d}/{config.train.epochs}  "
+                f"  epoch {epoch + 1:3d}/{train.epochs}  "
                 f"ssl_loss {record['ssl_loss']:.4f}"
                 + (
                     f"  holdout {record['holdout_loss']:.4f}"
@@ -281,22 +347,41 @@ def pretrain(
             result.best_score = score
             result.best_epoch = epoch
             stale = 0
-            result.best_checkpoint = _persist(
-                output / "pretrain_best.pt", epoch, model, optimiser, config,
-                record, with_optimiser=False,
-            )
+            # Captured, not written: SSL reconstruction loss improves on nearly
+            # every epoch, so writing here is writing every epoch. The copy is
+            # 14 MB of host memory against 14 MB of Drive traffic per epoch.
+            best_state = _capture(model)
+            best_record = record
+            best_dirty = True
         else:
             stale += 1
-        _persist(output / "pretrain_last.pt", epoch, model, optimiser, config, record)
 
-        # After the durable write, not before it: the encoder the SSL arms
-        # fine-tune from is already safe either way, but breaking first would
-        # leave pretrain_last.pt and the synced database a few epochs behind
-        # the run that actually happened.
-        if stopping and stale >= config.train.patience:
+        halting = stopping and stale >= train.patience
+        # The durable writes happen before any break, so the files describe the
+        # run that actually happened rather than trailing it. The last epoch
+        # and an early stop always flush, whatever checkpoint_every says.
+        if _due(epoch, train.checkpoint_every) or epoch + 1 == train.epochs or halting:
+            if best_dirty and best_state is not None:
+                result.best_checkpoint = _persist(
+                    output / "pretrain_best.pt", result.best_epoch, model,
+                    optimiser, config, best_record, with_optimiser=False,
+                    state=best_state,
+                )
+                best_dirty = False
+            _persist(output / "pretrain_last.pt", epoch, model, optimiser, config, record)
+
+        if _due(epoch, train.snapshot_every):
+            # Weights only, and never overwritten: this is the ladder a budget
+            # comparison fine-tunes from.
+            _persist(
+                output / snapshot_name(epoch + 1), epoch, model, optimiser,
+                config, record, with_optimiser=False,
+            )
+
+        if halting:
             if progress:
                 print(f"  early stop: {stale} epochs without holdout improvement")
-            _warn_if_schedule_incomplete(optimiser, config.train, epoch)
+            _warn_if_schedule_incomplete(optimiser, train, epoch)
             break
 
     result.seconds = time.perf_counter() - started
@@ -342,6 +427,9 @@ def train_supervised(
     output = Path(config.output_dir)
     result = TrainingResult()
     stale = 0
+    best_state: dict[str, Any] | None = None
+    best_record: dict[str, float] = {}
+    best_dirty = False
     started = time.perf_counter()
 
     for epoch in range(config.train.epochs):
@@ -385,15 +473,27 @@ def train_supervised(
             result.best_score = score
             result.best_epoch = epoch
             stale = 0
-            result.best_checkpoint = _persist(
-                output / "best.pt", epoch, model, optimiser, config, record,
-                with_optimiser=False,
-            )
+            best_state = _capture(model)
+            best_record = record
+            best_dirty = True
         else:
             stale += 1
-        _persist(output / "last.pt", epoch, model, optimiser, config, record)
 
-        if config.train.patience and stale >= config.train.patience:
+        halting = bool(config.train.patience) and stale >= config.train.patience
+        if (
+            _due(epoch, config.train.checkpoint_every)
+            or epoch + 1 == config.train.epochs
+            or halting
+        ):
+            if best_dirty and best_state is not None:
+                result.best_checkpoint = _persist(
+                    output / "best.pt", result.best_epoch, model, optimiser,
+                    config, best_record, with_optimiser=False, state=best_state,
+                )
+                best_dirty = False
+            _persist(output / "last.pt", epoch, model, optimiser, config, record)
+
+        if halting:
             if progress:
                 print(f"  early stop: {stale} evaluations without improvement")
             _warn_if_schedule_incomplete(optimiser, config.train, epoch)
@@ -545,6 +645,7 @@ def _persist(
     metrics: dict[str, float],
     *,
     with_optimiser: bool = True,
+    state: dict[str, Any] | None = None,
 ) -> Path | None:
     """Write a checkpoint and copy the tracking database beside it.
 
@@ -565,6 +666,8 @@ def _persist(
             :func:`~ecg.training.checkpoints.load_encoder_weights` and by the
             test evaluation -- so the optimiser state would be two thirds of a
             40 MB Drive write for nothing.
+        state: Weights to write in place of the model's current ones, for a
+            best checkpoint held in memory and flushed later.
 
     Returns:
         The checkpoint path, or ``None`` if the write failed.
@@ -577,6 +680,7 @@ def _persist(
             optimiser=optimiser if with_optimiser else None,
             config=config,
             metrics=metrics,
+            state=state,
         )
     except Exception as error:  # noqa: BLE001 - never lose a run to a bad mount
         warnings.warn(

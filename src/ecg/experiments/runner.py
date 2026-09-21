@@ -40,7 +40,13 @@ from ecg.models.encoder import build_classifier
 from ecg.models.ssl import build_pretrainer
 from ecg.training.checkpoints import load_encoder_weights
 from ecg.training.config import DEFAULT_VARIANT, RunConfig
-from ecg.training.loops import evaluate_classifier, pretrain, resolve_device, train_supervised
+from ecg.training.loops import (
+    evaluate_classifier,
+    pretrain,
+    resolve_device,
+    set_seed,
+    train_supervised,
+)
 from ecg.training.metrics import ClassificationMetrics
 from ecg.training.tracking import UNKNOWN, Tracker, git_provenance
 from ecg.experiments.plan import RunSpec
@@ -283,9 +289,14 @@ def run_plan(
 
         resolved = spec
         if spec.depends_on:
-            source = checkpoints.get(spec.depends_on)
-            if source is None:
-                source = str(root / spec.depends_on / "pretrain_best.pt")
+            if spec.checkpoint_name:
+                # A named file inside the dependency, not whatever it selected:
+                # a budget ladder fine-tunes from specific mid-run snapshots.
+                source = str(root / spec.depends_on / spec.checkpoint_name)
+            else:
+                source = checkpoints.get(spec.depends_on)
+                if source is None:
+                    source = str(root / spec.depends_on / "pretrain_best.pt")
             if not Path(source).exists():
                 raise FileNotFoundError(
                     f"run {spec.name!r} needs the checkpoint from "
@@ -296,6 +307,7 @@ def run_plan(
                 kind=spec.kind,
                 config=spec.config.with_(pretrained_from=source),
                 depends_on=spec.depends_on,
+                checkpoint_name=spec.checkpoint_name,
             )
 
         if progress:
@@ -816,6 +828,10 @@ def _run_pretrain(
     """Execute a pretraining run."""
     pool = workspace.cohorts["ssl"]
     kept, held = holdout_split(pool, config.ssl_holdout, seed=config.subset_seed)
+    # Before the model exists, not after: weight initialisation draws from the
+    # global generator, and the loop's own set_seed comes too late to govern a
+    # model its caller already built. See _seeded_model.
+    set_seed(config.train.seed)
     model = build_pretrainer(config.model, config.ssl)
     device = resolve_device(config.train.device)
 
@@ -865,6 +881,12 @@ def _run_supervised(
         workspace.cohorts["train"], (config.label_fraction,), seed=config.subset_seed
     )[config.label_fraction]
 
+    # See _run_pretrain: the seed has to be set before the weights are drawn.
+    # It matters most here, because the paired contrasts in this module claim
+    # that two arms at one seed differ only in the embedder -- which is untrue
+    # if their initialisations came from wherever the previous run left the
+    # global generator.
+    set_seed(config.train.seed)
     model = build_classifier(config.model)
     if config.pretrained_from:
         load_encoder_weights(model, config.pretrained_from)

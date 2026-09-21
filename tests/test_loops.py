@@ -21,10 +21,11 @@ from ecg.data.ptbxl import SUPERCLASSES
 from ecg.models.config import ModelConfig, SslConfig
 from ecg.models.encoder import build_classifier
 from ecg.models.ssl import build_pretrainer
-from ecg.training.checkpoints import load_checkpoint
+from ecg.training.checkpoints import load_checkpoint, load_encoder_weights
 from ecg.training.config import RunConfig, TrainConfig
 from ecg.training.loops import (
     evaluate_classifier,
+    snapshot_name,
     predict,
     pretrain,
     train_supervised,
@@ -406,6 +407,187 @@ class TestPretrainLoop:
                 ),
                 progress=False,
             )
+
+    def test_the_ssl_budget_drives_the_loop(self, store, config) -> None:
+        """--epochs is the fine-tuning budget; pretraining reads ssl_epochs."""
+        cohort = Cohort(
+            "ssl", store.ecg_ids.copy(),
+            np.zeros((N_RECORDS, len(SUPERCLASSES)), dtype=np.float32),
+        )
+        kept, held = holdout_split(cohort, 0.25, seed=0)
+        longer = config.with_(
+            train=TrainConfig(
+                epochs=2, ssl_epochs=6, batch_size=16, amp=False, device="cpu"
+            )
+        )
+        result = pretrain(
+            build_pretrainer(longer.model, longer.ssl),
+            EcgBatches(store, kept, batch_size=16, seed=0),
+            EcgBatches(store, held, batch_size=16, shuffle=False),
+            longer,
+            progress=False,
+        )
+        assert result.epochs_run == 6
+
+
+class TestCheckpointThrottling:
+    """At 600 epochs the per-epoch write is the run, not the instrumentation:
+    55 MB to a Drive mount against an epoch of 65 steps."""
+
+    @pytest.fixture()
+    def cohorts(self, store):
+        cohort = Cohort(
+            "ssl", store.ecg_ids.copy(),
+            np.zeros((N_RECORDS, len(SUPERCLASSES)), dtype=np.float32),
+        )
+        return holdout_split(cohort, 0.25, seed=0)
+
+    @staticmethod
+    def _run(store, config, cohorts, **train):
+        kept, held = cohorts
+        changed = config.with_(
+            train=TrainConfig(batch_size=16, amp=False, device="cpu", **train)
+        )
+        return pretrain(
+            build_pretrainer(changed.model, changed.ssl),
+            EcgBatches(store, kept, batch_size=16, seed=0),
+            EcgBatches(store, held, batch_size=16, shuffle=False),
+            changed,
+            progress=False,
+        ), changed
+
+    def test_it_writes_less_often(self, store, config, cohorts, monkeypatch) -> None:
+        import ecg.training.loops as loops
+
+        writes: list[str] = []
+        original = loops.save_checkpoint
+
+        def counting(path, **kwargs):
+            writes.append(Path(path).name)
+            return original(path, **kwargs)
+
+        monkeypatch.setattr(loops, "save_checkpoint", counting)
+        self._run(store, config, cohorts, epochs=8, checkpoint_every=4)
+        # Epochs 4 and 8 only, rather than all eight.
+        assert writes.count("pretrain_last.pt") == 2
+
+    def test_the_selected_encoder_is_still_the_best_one(
+        self, store, config, cohorts
+    ) -> None:
+        """The whole risk of deferring the write: by the time it happens the
+        model has trained on, so the weights in hand are no longer the ones
+        that were selected."""
+        result, changed = self._run(
+            store, config, cohorts, epochs=6, lr=3e-3, checkpoint_every=6
+        )
+        payload = load_checkpoint(result.best_checkpoint)
+        assert payload["epoch"] == result.best_epoch
+
+        rebuilt = build_pretrainer(changed.model, changed.ssl)
+        rebuilt.load_state_dict(payload["model"])
+        # It has to be a real encoder, not a half-written or mismatched one.
+        assert load_encoder_weights(
+            build_classifier(changed.model), result.best_checkpoint
+        )
+
+    def test_the_final_epoch_always_flushes(self, store, config, cohorts) -> None:
+        """A period that does not divide the budget must not lose the end."""
+        result, _ = self._run(store, config, cohorts, epochs=7, checkpoint_every=4)
+        assert Path(result.best_checkpoint).exists()
+        assert (Path(config.output_dir) / "pretrain_last.pt").exists()
+
+    def test_throttling_does_not_change_what_is_selected(
+        self, store, config, cohorts
+    ) -> None:
+        """Seeded before each build, as the runner does: the loop's own
+        set_seed runs after its caller has already drawn the weights."""
+        torch.manual_seed(0)
+        every_epoch, _ = self._run(store, config, cohorts, epochs=6, lr=3e-3)
+        torch.manual_seed(0)
+        throttled, _ = self._run(
+            store, config, cohorts, epochs=6, lr=3e-3, checkpoint_every=3
+        )
+        assert throttled.best_epoch == every_epoch.best_epoch
+        assert throttled.best_score == pytest.approx(every_epoch.best_score)
+
+
+class TestSnapshots:
+    """The ladder a budget comparison fine-tunes from."""
+
+    @pytest.fixture()
+    def cohorts(self, store):
+        cohort = Cohort(
+            "ssl", store.ecg_ids.copy(),
+            np.zeros((N_RECORDS, len(SUPERCLASSES)), dtype=np.float32),
+        )
+        return holdout_split(cohort, 0.25, seed=0)
+
+    def test_they_are_written_on_the_period(self, store, config, cohorts) -> None:
+        kept, held = cohorts
+        changed = config.with_(
+            train=TrainConfig(
+                epochs=6, batch_size=16, amp=False, device="cpu", snapshot_every=2
+            )
+        )
+        pretrain(
+            build_pretrainer(changed.model, changed.ssl),
+            EcgBatches(store, kept, batch_size=16, seed=0),
+            EcgBatches(store, held, batch_size=16, shuffle=False),
+            changed,
+            progress=False,
+        )
+        output = Path(config.output_dir)
+        assert sorted(p.name for p in output.glob("pretrain_epoch*.pt")) == [
+            snapshot_name(2), snapshot_name(4), snapshot_name(6),
+        ]
+
+    def test_a_snapshot_can_start_a_classifier(self, store, config, cohorts) -> None:
+        """They are what ssl_budget_plan hands to a fine-tune, so they have to
+        be loadable exactly as pretrain_best.pt is."""
+        kept, held = cohorts
+        changed = config.with_(
+            train=TrainConfig(
+                epochs=4, batch_size=16, amp=False, device="cpu", snapshot_every=2
+            )
+        )
+        pretrain(
+            build_pretrainer(changed.model, changed.ssl),
+            EcgBatches(store, kept, batch_size=16, seed=0),
+            EcgBatches(store, held, batch_size=16, shuffle=False),
+            changed,
+            progress=False,
+        )
+        snapshot = Path(config.output_dir) / snapshot_name(2)
+        assert load_encoder_weights(build_classifier(changed.model), snapshot)
+
+    def test_none_are_written_by_default(self, store, config, cohorts) -> None:
+        kept, held = cohorts
+        pretrain(
+            build_pretrainer(config.model, config.ssl),
+            EcgBatches(store, kept, batch_size=16, seed=0),
+            EcgBatches(store, held, batch_size=16, shuffle=False),
+            config,
+            progress=False,
+        )
+        assert not list(Path(config.output_dir).glob("pretrain_epoch*.pt"))
+
+    def test_snapshots_carry_no_optimiser_state(self, store, config, cohorts) -> None:
+        """Three times the bytes for something only ever read for its weights."""
+        kept, held = cohorts
+        changed = config.with_(
+            train=TrainConfig(
+                epochs=2, batch_size=16, amp=False, device="cpu", snapshot_every=2
+            )
+        )
+        pretrain(
+            build_pretrainer(changed.model, changed.ssl),
+            EcgBatches(store, kept, batch_size=16, seed=0),
+            EcgBatches(store, held, batch_size=16, shuffle=False),
+            changed,
+            progress=False,
+        )
+        payload = load_checkpoint(Path(config.output_dir) / snapshot_name(2))
+        assert payload["optimiser"] is None
 
     def test_checkpoint_can_initialise_a_classifier(self, store, config) -> None:
         """The whole point of arms C and D."""

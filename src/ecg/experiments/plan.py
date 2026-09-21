@@ -39,10 +39,13 @@ difference is unaffected and only the marginal spread widens.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import reduce
+from math import gcd
 from typing import Literal, Sequence
 
 from ecg.models.config import Embedder
 from ecg.training.config import DEFAULT_VARIANT, RunConfig
+from ecg.training.loops import snapshot_name
 
 RunKind = Literal["pretrain", "supervised"]
 
@@ -51,6 +54,11 @@ DEFAULT_FRACTIONS: tuple[float, ...] = (0.2, 0.5, 1.0)
 
 #: Mask ratios compared before the main study.
 DEFAULT_MASK_RATIOS: tuple[float, ...] = (0.3, 0.5, 0.7)
+
+#: Pretraining budgets compared by :func:`ssl_budget_plan`, in epochs. The
+#: study's default of 50 is 3,250 SSL steps at batch 256, which is very few for
+#: masked reconstruction; these bracket the range worth asking about.
+DEFAULT_SSL_BUDGETS: tuple[int, ...] = (100, 200, 400, 600)
 
 #: Replicate seeds. Five is the smallest n for which a standard deviation is
 #: worth printing and the paired interval is not dominated by its own error;
@@ -71,12 +79,17 @@ class RunSpec:
         config: The complete run configuration.
         depends_on: Name of the pretraining run supplying the encoder, or
             ``None`` for a from-scratch arm.
+        checkpoint_name: File to load from inside ``depends_on``'s directory,
+            instead of the selected ``pretrain_best.pt``. Only
+            :func:`ssl_budget_plan` sets it, to fine-tune from a mid-run
+            snapshot; leaving it ``None`` is what every arm of the study does.
     """
 
     name: str
     kind: RunKind
     config: RunConfig
     depends_on: str | None = None
+    checkpoint_name: str | None = None
 
     @property
     def arm(self) -> str:
@@ -345,6 +358,158 @@ def ablation_plan(
     return specs
 
 
+def budget_name(embedder: str, mask_ratio: float, epochs: int) -> str:
+    """Name a pretraining run that is one rung of a budget ladder.
+
+    Args:
+        embedder: ``"linear"`` or ``"conv"``.
+        mask_ratio: Masking ratio.
+        epochs: The pretraining budget.
+
+    Returns:
+        A name like ``"pretrain-linear-m50-e0600"``.
+    """
+    return f"{pretrain_name(embedder, mask_ratio)}-e{epochs:04d}"
+
+
+def ssl_budget_plan(
+    base: RunConfig,
+    *,
+    budgets: tuple[int, ...] = DEFAULT_SSL_BUDGETS,
+    embedder: Embedder = "linear",
+    fraction: float = 0.2,
+    seeds: tuple[int, ...] = (0,),
+    from_snapshots: bool = False,
+) -> list[RunSpec]:
+    """Ask how long pretraining is worth running, before paying for it.
+
+    The study's SSL budget multiplies the cost of the ten pretraining runs
+    directly, and held-out reconstruction loss will not tell you where to set
+    it: on 17,418 records it keeps falling long after the representation has
+    stopped getting more useful, so ``pretrain_best.pt`` in a long run is
+    essentially the last epoch. The only honest signal is downstream -- fine-
+    tune from encoders of different ages and look at validation.
+
+    Two ways to get that, and they answer slightly different questions.
+
+    **Separate runs** (the default). One pretraining per budget, each annealed
+    across its own budget, then one fine-tune each. This is the comparison you
+    actually want -- "is a 600-epoch run better than a 150-epoch run?" -- with
+    every rung a run you could really ship. It costs ``sum(budgets)`` epochs.
+
+    **From snapshots** (``from_snapshots=True``). One pretraining at the
+    longest budget, snapshotting as it goes, then one fine-tune per snapshot.
+    Costs ``max(budgets)`` epochs, so roughly half. But the short rungs are
+    taken mid-anneal, at a learning rate still near peak, so they understate
+    what a real run of that length would achieve. It tells you where the curve
+    flattens, not what a 150-epoch run is worth. Good for a first look; do not
+    put its numbers in the write-up as if they were the other thing.
+
+    Selection is on validation, and the chosen budget is then frozen for every
+    arm of the study -- as with the mask ratio, tuning it per arm would fold
+    the SSL setup into what is being compared.
+
+    Args:
+        base: Base configuration.
+        budgets: Pretraining lengths to compare, in epochs.
+        embedder: Which arm to select on.
+        fraction: Label fraction to fine-tune at. The smallest one, where SSL's
+            effect is largest and the fine-tunes are cheapest.
+        seeds: Replicate seeds. One is usually enough to see the shape.
+        from_snapshots: Take the cheap route described above.
+
+    Returns:
+        The runs, each pretraining before the fine-tunes that depend on it.
+
+    Raises:
+        ValueError: If ``budgets`` is empty or holds a value below one, or if
+            ``seeds`` is empty or holds a repeat.
+    """
+    seeds = _checked_seeds(seeds)
+    several = len(seeds) > 1
+    ladder = tuple(sorted(set(budgets)))
+    if not ladder:
+        raise ValueError("at least one budget is required")
+    if ladder[0] < 1:
+        raise ValueError(f"budgets must be positive, got {sorted(budgets)}")
+
+    ratio = base.ssl.mask_ratio
+    specs: list[RunSpec] = []
+
+    for seed in seeds:
+        replicate = _replicate(base, seed)
+        if from_snapshots:
+            # Every rung must land on a snapshot, so snapshot at their gcd.
+            every = reduce(gcd, ladder)
+            longest = ladder[-1]
+            source = variant_name(
+                base.variant,
+                seed_name(budget_name(embedder, ratio, longest), seed, several=several),
+            )
+            specs.append(
+                RunSpec(
+                    name=source,
+                    kind="pretrain",
+                    config=replicate.with_(
+                        name=source,
+                        model=base.model.for_arm(embedder),
+                        train=_budgeted(replicate, longest, snapshot_every=every),
+                        pretrained_from=None,
+                    ),
+                )
+            )
+            for rung in ladder:
+                name = f"{source}-snap{rung:04d}-f{int(round(fraction * 100)):03d}"
+                specs.append(
+                    RunSpec(
+                        name=name,
+                        kind="supervised",
+                        config=replicate.with_(
+                            name=name,
+                            model=base.model.for_arm(embedder),
+                            label_fraction=fraction,
+                            pretrained_from=source,
+                        ),
+                        depends_on=source,
+                        checkpoint_name=snapshot_name(rung),
+                    )
+                )
+            continue
+
+        for rung in ladder:
+            source = variant_name(
+                base.variant,
+                seed_name(budget_name(embedder, ratio, rung), seed, several=several),
+            )
+            specs.append(
+                RunSpec(
+                    name=source,
+                    kind="pretrain",
+                    config=replicate.with_(
+                        name=source,
+                        model=base.model.for_arm(embedder),
+                        train=_budgeted(replicate, rung),
+                        pretrained_from=None,
+                    ),
+                )
+            )
+            name = f"{source}-f{int(round(fraction * 100)):03d}"
+            specs.append(
+                RunSpec(
+                    name=name,
+                    kind="supervised",
+                    config=replicate.with_(
+                        name=name,
+                        model=base.model.for_arm(embedder),
+                        label_fraction=fraction,
+                        pretrained_from=source,
+                    ),
+                    depends_on=source,
+                )
+            )
+    return specs
+
+
 def describe_plan(specs: list[RunSpec]) -> str:
     """Render a plan as a table for review before spending GPU time.
 
@@ -364,15 +529,27 @@ def describe_plan(specs: list[RunSpec]) -> str:
         "",
     ]
     header = (
-        f"{'run':44s} {'kind':11s} {'arm':12s} {'labels':>7s} {'mask':>5s} {'seed':>5s}"
+        f"{'run':52s} {'kind':11s} {'arm':12s} {'labels':>7s} {'mask':>5s} "
+        f"{'seed':>5s} {'epochs':>7s}"
     )
     lines += [header, "-" * len(header)]
+    total = 0
     for spec in specs:
         labels = "-" if spec.kind == "pretrain" else f"{spec.config.label_fraction:.0%}"
-        lines.append(
-            f"{spec.name:44s} {spec.kind:11s} {spec.arm:12s} {labels:>7s} "
-            f"{spec.config.ssl.mask_ratio:>5.2f} {spec.config.train.seed:>5d}"
+        budget = (
+            spec.config.train.for_pretraining().epochs
+            if spec.kind == "pretrain"
+            else spec.config.train.epochs
         )
+        total += budget
+        lines.append(
+            f"{spec.name:52s} {spec.kind:11s} {spec.arm:12s} {labels:>7s} "
+            f"{spec.config.ssl.mask_ratio:>5.2f} {spec.config.train.seed:>5d} "
+            f"{budget:>7d}"
+        )
+    # The number that actually sizes the bill, since pretraining and
+    # fine-tuning no longer share a budget and a run count no longer implies one.
+    lines += ["", f"{total:,} epochs total (ceiling; early stopping may cut it)"]
     return "\n".join(lines)
 
 
@@ -397,6 +574,32 @@ def _checked_seeds(seeds: Sequence[int]) -> tuple[int, ...]:
     if len(set(seeds)) != len(seeds):
         raise ValueError(f"seeds must be distinct, got {list(seeds)}")
     return seeds
+
+
+def _budgeted(base: RunConfig, epochs: int, *, snapshot_every: int = 0):
+    """Return a training config whose *pretraining* budget is ``epochs``.
+
+    ``ssl_schedule_epochs`` is reset to 0, meaning "anneal across the whole SSL
+    budget". Carrying the base value through would either stretch the decay
+    past a short rung or fail validation outright, and every rung of a ladder
+    has to be a run that annealed properly on its own terms.
+
+    Args:
+        base: Configuration to derive from.
+        epochs: Pretraining epochs for this rung.
+        snapshot_every: Snapshot period, or 0 for none.
+
+    Returns:
+        A new training config; the supervised ``epochs`` is left alone.
+    """
+    return base.train.__class__(
+        **{
+            **vars(base.train),
+            "ssl_epochs": epochs,
+            "ssl_schedule_epochs": 0,
+            "snapshot_every": snapshot_every,
+        }
+    )
 
 
 def _replicate(base: RunConfig, seed: int) -> RunConfig:

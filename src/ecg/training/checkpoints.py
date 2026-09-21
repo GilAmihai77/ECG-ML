@@ -37,6 +37,7 @@ def save_checkpoint(
     optimiser: torch.optim.Optimizer | None,
     config: RunConfig,
     metrics: dict[str, float] | None = None,
+    state: dict[str, Any] | None = None,
 ) -> Path:
     """Write a resumable checkpoint.
 
@@ -47,11 +48,16 @@ def save_checkpoint(
     Args:
         path: Destination file.
         epoch: Completed epoch number.
-        model: Model whose ``state_dict`` is saved.
+        model: Model whose ``state_dict`` is saved, unless ``state`` is given.
         optimiser: Optimiser state, so a run resumes rather than restarts.
             ``None`` for a final, inference-only checkpoint.
         config: The run configuration.
         metrics: Metrics at this epoch, for choosing between checkpoints later.
+        state: Weights to write instead of the model's current ones. Used when
+            a loop holds the best weights in memory and flushes them later --
+            by then the model has trained on, so ``model.state_dict()`` is no
+            longer the thing being saved. ``model`` is still required, as the
+            architecture the state belongs to.
 
     Returns:
         The path written.
@@ -60,7 +66,7 @@ def save_checkpoint(
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
         "epoch": epoch,
-        "model": model.state_dict(),
+        "model": model.state_dict() if state is None else state,
         "optimiser": optimiser.state_dict() if optimiser is not None else None,
         "config": config.to_dict(),
         "metrics": metrics or {},

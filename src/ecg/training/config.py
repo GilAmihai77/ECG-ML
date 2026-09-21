@@ -58,6 +58,39 @@ class TrainConfig:
         amp: Use bfloat16 autocast on CUDA. Ignored on CPU. bf16 needs no
             gradient scaler, unlike fp16, so there is no scaler to misconfigure.
         device: ``"auto"``, ``"cpu"`` or ``"cuda"``.
+        ssl_epochs: Epochs for pretraining runs; ``0`` means ``epochs``.
+
+            Pretraining and fine-tuning want budgets that differ by an order of
+            magnitude. The SSL pool is 17,418 records against 10,254 labelled
+            ones, and masked reconstruction needs far more passes to say
+            anything than a five-class head does -- 50 epochs is 3,250 SSL steps
+            at batch 256, which is very few. Without this field one number set
+            both, so raising it for pretraining also bought 600-epoch
+            fine-tunes nobody asked for, and those are 60 of the 70 runs.
+        ssl_schedule_epochs: ``schedule_epochs`` for pretraining runs; ``0``
+            means ``ssl_epochs``, i.e. anneal across the whole SSL budget.
+            That is usually what a pretraining run wants: it is one long run
+            you intend to finish, not one you are hoping to cut short.
+        checkpoint_every: Write the durable checkpoints every this many epochs;
+            ``1`` writes every epoch.
+
+            At 50 epochs the per-epoch write is noise. At 600 it is the run:
+            ``pretrain_last.pt`` is 41.7 MB with its optimiser state and
+            ``pretrain_best.pt`` 13.9 MB, and SSL reconstruction loss improves
+            almost every epoch, so both get written almost every epoch -- 33 GB
+            per run to a Drive mount, against an epoch of 65 steps over a 3.5M
+            parameter model. The best weights are held in memory between
+            writes, so raising this risks losing at most this many epochs of
+            progress to a disconnect, never the selected encoder itself, which
+            is always flushed when the run ends.
+        snapshot_every: Also write a weights-only ``pretrain_epoch<N>.pt`` every
+            this many epochs; ``0`` writes none. Pretraining only.
+
+            For answering "is 600 epochs better than 150?" with one pretraining
+            run and a few fine-tunes rather than four pretraining runs --
+            see :func:`ecg.experiments.plan.ssl_budget_plan`. Held-out
+            reconstruction loss will not answer it, because it keeps falling
+            long after the representation stops improving.
         eval_every: Epochs between validation passes. Supervised training only;
             pretraining evaluates its holdout every epoch.
         patience: Stop after this many evaluations without improvement; ``0``
@@ -82,6 +115,10 @@ class TrainConfig:
     grad_clip: float = 1.0
     min_lr_ratio: float = 0.01
     schedule_epochs: int = 0
+    ssl_epochs: int = 0
+    ssl_schedule_epochs: int = 0
+    checkpoint_every: int = 1
+    snapshot_every: int = 0
     seed: int = 0
     amp: bool = True
     device: str = "auto"
@@ -117,6 +154,48 @@ class TrainConfig:
                 "the run ends, which is the stretched-cosine problem this "
                 "field exists to avoid. Raise epochs, or lower schedule_epochs."
             )
+        if self.ssl_epochs < 0:
+            raise ValueError(f"ssl_epochs must not be negative, got {self.ssl_epochs}")
+        if self.ssl_schedule_epochs < 0:
+            raise ValueError(
+                f"ssl_schedule_epochs must not be negative, got "
+                f"{self.ssl_schedule_epochs}"
+            )
+        if self.ssl_schedule_epochs > (self.ssl_epochs or self.epochs):
+            raise ValueError(
+                f"ssl_schedule_epochs ({self.ssl_schedule_epochs}) must not "
+                f"exceed the pretraining budget "
+                f"({self.ssl_epochs or self.epochs})"
+            )
+        if self.checkpoint_every < 1:
+            raise ValueError(
+                f"checkpoint_every must be positive, got {self.checkpoint_every}"
+            )
+        if self.snapshot_every < 0:
+            raise ValueError(
+                f"snapshot_every must not be negative, got {self.snapshot_every}"
+            )
+
+
+    def for_pretraining(self) -> TrainConfig:
+        """The budget a pretraining run should use.
+
+        Substitutes ``ssl_epochs`` for ``epochs`` when one is set, so the two
+        stages can differ by the order of magnitude they want to differ by.
+        Everything else -- learning rate, batch size, clipping, seed -- is
+        deliberately shared, because those must stay identical across the arms.
+
+        Returns:
+            ``self`` when no SSL budget is set, otherwise a copy with the
+            pretraining epochs and schedule in place.
+        """
+        if not self.ssl_epochs:
+            return self
+        return replace(
+            self,
+            epochs=self.ssl_epochs,
+            schedule_epochs=self.ssl_schedule_epochs,
+        )
 
 
 @dataclass(frozen=True)

@@ -23,9 +23,11 @@ from ecg.experiments.plan import (
     DEFAULT_FRACTIONS,
     DEFAULT_MASK_RATIOS,
     DEFAULT_SEEDS,
+    DEFAULT_SSL_BUDGETS,
     ablation_plan,
     describe_plan,
     experiment_plan,
+    ssl_budget_plan,
 )
 from ecg.experiments.runner import (
     Workspace,
@@ -52,9 +54,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--plan",
-        choices=("study", "ablation"),
+        choices=("study", "ablation", "ssl-budget"),
         default="study",
-        help="'study' is the four arms; 'ablation' selects the mask ratio first.",
+        help=(
+            "'study' is the four arms; 'ablation' selects the mask ratio "
+            "first; 'ssl-budget' asks how long pretraining is worth running "
+            "before the study multiplies that cost by ten."
+        ),
     )
     parser.add_argument("--store", default="data/store_100hz", help="Waveform store.")
     parser.add_argument("--metadata", default="data/ptbxl", help="PTB-XL root.")
@@ -106,6 +112,66 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mask-span", type=int, default=2)
     parser.add_argument(
+        "--ssl-epochs",
+        type=int,
+        default=0,
+        help=(
+            "Epochs for pretraining runs; 0 means --epochs. Pretraining and "
+            "fine-tuning want budgets an order of magnitude apart -- 50 epochs "
+            "is only 3,250 SSL steps at batch 256 -- and without this one "
+            "number set both, so a long SSL budget also bought long "
+            "fine-tunes, which are 60 of the study's 70 runs."
+        ),
+    )
+    parser.add_argument(
+        "--ssl-schedule-epochs",
+        type=int,
+        default=0,
+        help="--schedule-epochs for pretraining runs; 0 anneals over --ssl-epochs.",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=1,
+        help=(
+            "Write the durable checkpoints every N epochs. At 600 epochs the "
+            "per-epoch write is the run, not the instrumentation: 55 MB to "
+            "Drive against an epoch of 65 steps. The best weights are held in "
+            "memory and always flushed when the run ends, so raising this "
+            "risks losing N epochs of progress to a disconnect, never the "
+            "selected encoder."
+        ),
+    )
+    parser.add_argument(
+        "--snapshot-every",
+        type=int,
+        default=0,
+        help=(
+            "Also write a weights-only pretrain_epoch<N>.pt every N epochs; 0 "
+            "writes none. Set automatically by '--plan ssl-budget "
+            "--from-snapshots'."
+        ),
+    )
+    parser.add_argument(
+        "--ssl-budgets",
+        type=int,
+        nargs="+",
+        default=list(DEFAULT_SSL_BUDGETS),
+        help="Pretraining budgets compared by the 'ssl-budget' plan.",
+    )
+    parser.add_argument(
+        "--from-snapshots",
+        action="store_true",
+        help=(
+            "'ssl-budget' only: pretrain once at the longest budget and "
+            "fine-tune from mid-run snapshots, instead of one properly "
+            "annealed run per budget. Roughly half the cost, but the short "
+            "rungs are taken at a learning rate still near peak and so "
+            "understate what a real run of that length reaches. A first look, "
+            "not a number for the write-up."
+        ),
+    )
+    parser.add_argument(
         "--fractions",
         type=float,
         nargs="+",
@@ -123,13 +189,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--seeds",
         type=int,
         nargs="+",
-        default=list(DEFAULT_SEEDS),
+        default=None,
         help=(
-            "Replicate seeds. Every experiment runs once per seed and is "
-            "reported as mean +/- sd, so this multiplies the study's cost by "
-            "its length -- check the run count that --dry-run prints. Each "
-            "seed drives weights, batch order, masking AND which labelled "
-            "records the fraction draws."
+            f"Replicate seeds. Every experiment runs once per seed and is "
+            f"reported as mean +/- sd, so this multiplies cost by its length "
+            f"-- check the epoch total that --dry-run prints. Each seed drives "
+            f"weights, batch order, masking AND which labelled records the "
+            f"fraction draws. Defaults to {list(DEFAULT_SEEDS)} for --plan "
+            f"study, and to [{DEFAULT_SEEDS[0]}] for the selection plans, "
+            f"which choose a setting on validation rather than reporting a "
+            f"result and do not need error bars to do it."
         ),
     )
     parser.add_argument(
@@ -219,15 +288,19 @@ def base_config(args: argparse.Namespace) -> RunConfig:
             lr=args.lr,
             # Both seeds are overridden per replicate by the plan; the first is
             # only a placeholder, so a base config printed on its own is honest.
-            seed=args.seeds[0],
+            seed=(args.seeds or DEFAULT_SEEDS)[0],
             amp=not args.no_amp,
             device=args.device,
             patience=args.patience,
+            ssl_epochs=args.ssl_epochs,
+            ssl_schedule_epochs=args.ssl_schedule_epochs,
+            checkpoint_every=args.checkpoint_every,
+            snapshot_every=args.snapshot_every,
         ),
         ssl=SslConfig(mask_ratio=args.mask_ratio, mask_span=args.mask_span),
         store_path=args.store,
         metadata_path=args.metadata,
-        subset_seed=args.seeds[0],
+        subset_seed=(args.seeds or DEFAULT_SEEDS)[0],
         experiment=args.experiment,
         tracking_uri=args.tracking,
         output_dir=str(output),
@@ -246,16 +319,28 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     base = base_config(args)
 
-    if args.plan == "ablation":
+    # A selection plan picks a setting on validation; it is not a reported
+    # result, so it does not need five replicates and should not silently cost
+    # what five replicates cost. An explicit --seeds still wins.
+    seeds = tuple(args.seeds) if args.seeds else None
+    if args.plan == "ssl-budget":
+        specs = ssl_budget_plan(
+            base,
+            budgets=tuple(args.ssl_budgets),
+            fraction=min(args.fractions),
+            seeds=seeds or (DEFAULT_SEEDS[0],),
+            from_snapshots=args.from_snapshots,
+        )
+    elif args.plan == "ablation":
         specs = ablation_plan(
             base, mask_ratios=tuple(args.mask_ratios), fraction=min(args.fractions),
-            seeds=tuple(args.seeds),
+            seeds=seeds or (DEFAULT_SEEDS[0],),
         )
     else:
         specs = experiment_plan(
             base,
             fractions=tuple(args.fractions),
-            seeds=tuple(args.seeds),
+            seeds=seeds or DEFAULT_SEEDS,
             share_pretraining=args.share_pretraining,
         )
 
