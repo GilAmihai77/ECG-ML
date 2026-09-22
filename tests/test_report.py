@@ -9,6 +9,8 @@ contradict the numbers logged to MLflow during the run.
 
 from __future__ import annotations
 
+import sqlite3
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -97,6 +99,55 @@ def _replicates(labels, scores, thresholds, *, seeds=(0, 1, 2), arm="linear"):
         )
         for seed in seeds
     ]
+
+
+def _mlflow_db(
+    directory,
+    runs: list[tuple[str, str, int, int]],
+    other: list[tuple[str, str, int, int]] | None = None,
+):
+    """Build the slice of MLflow's SQLite schema that ``training_history`` reads.
+
+    Args:
+        directory: Where to write ``mlflow.db``.
+        runs: ``(name, run_uuid, start_time, epochs)`` for experiment
+            ``ecg-ssl``. Each run logs ``holdout_loss`` once per epoch.
+        other: The same, for a second experiment, so the filter can be tested.
+
+    Returns:
+        Path to the database.
+    """
+    path = directory / "mlflow.db"
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.execute("CREATE TABLE experiments (experiment_id INT, name TEXT)")
+        connection.execute(
+            "CREATE TABLE runs (run_uuid TEXT, name TEXT, experiment_id INT, "
+            "start_time INT)"
+        )
+        connection.execute(
+            "CREATE TABLE metrics (run_uuid TEXT, key TEXT, step INT, value REAL, "
+            "is_nan INT)"
+        )
+        for experiment_id, (name, members) in enumerate(
+            (("ecg-ssl", runs), ("ecg-ablation", other or [])), start=1
+        ):
+            connection.execute(
+                "INSERT INTO experiments VALUES (?, ?)", (experiment_id, name)
+            )
+            for run_name, run_uuid, started, epochs in members:
+                connection.execute(
+                    "INSERT INTO runs VALUES (?, ?, ?, ?)",
+                    (run_uuid, run_name, experiment_id, started),
+                )
+                connection.executemany(
+                    "INSERT INTO metrics VALUES (?, 'holdout_loss', ?, ?, 0)",
+                    [(run_uuid, step, 1.0 - step / 1000) for step in range(epochs)],
+                )
+        connection.commit()
+    finally:
+        connection.close()
+    return path
 
 
 @pytest.fixture()
@@ -368,6 +419,39 @@ class TestTrackingHistory:
     def test_missing_database_is_reported(self, tmp_path) -> None:
         with pytest.raises(FileNotFoundError, match="no tracking database"):
             training_history(tmp_path / "absent.db")
+
+    def test_one_run_per_name_reads_straight_through(self, tmp_path) -> None:
+        database = _mlflow_db(tmp_path, [("pretrain-conv", "a", 1, 3)])
+        history = training_history(database)
+        assert list(history.columns) == ["run", "key", "step", "value"]
+        assert len(history) == 3
+
+    def test_a_repeated_name_keeps_the_later_run(self, tmp_path) -> None:
+        """What a database holding two sessions looks like.
+
+        MLflow does not require run names to be unique, and restoring a snapshot
+        at session start puts both sessions in one file. Because ``curve``
+        matches on the name alone, keeping both would splice a 50-epoch run and
+        a 600-epoch rerun into one series -- silently, and looking plausible.
+        """
+        database = _mlflow_db(
+            tmp_path,
+            [("pretrain-conv", "old", 1_000, 50), ("pretrain-conv", "new", 2_000, 600)],
+        )
+        with pytest.warns(RuntimeWarning, match="more than once"):
+            history = training_history(database)
+
+        assert history["run"].unique().tolist() == ["pretrain-conv"]
+        assert len(curve(history, "pretrain-conv", "holdout_loss")) == 600
+
+    def test_the_experiment_filter_still_applies(self, tmp_path) -> None:
+        database = _mlflow_db(
+            tmp_path,
+            [("pretrain-conv", "a", 1, 3)],
+            other=[("ablation-run", "b", 1, 4)],
+        )
+        assert len(training_history(database, experiment="ecg-ssl")) == 3
+        assert len(training_history(database)) == 7
 
     def test_curve_is_empty_for_an_unlogged_key(self) -> None:
         history = pd.DataFrame(

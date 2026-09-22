@@ -41,15 +41,26 @@ anything, and a GPU runtime spent reading SQLite is a GPU runtime wasted.
 ## Where the database comes from
 
 During a study MLflow writes to `/content/mlruns/mlflow.db` on Colab's **local**
-disk, and every epoch a consistent snapshot is copied to Drive beside that
-epoch's checkpoint — `MyDrive/ecg/runs/<study>/<run>/mlflow.db`. Each snapshot is
-a copy of the *whole* database as it stood at that moment, not just that run's
-rows, so **the most recently modified snapshot is the most complete one**. Cell 3
-sorts by modification time for exactly that reason; picking by run name would
-usually pick an older database.
+disk, and a consistent snapshot is copied to Drive beside each checkpoint —
+`MyDrive/ecg/runs/<study>/<run>/mlflow.db`. Each snapshot is a copy of the
+*whole* database as it stood at that moment, not just that run's rows.
 
-If you ran the end-of-session `sync_tracking` from notebook 02, `MyDrive/ecg/mlflow.db`
-is newer still, and cell 3 will find it the same way.
+So within one session the snapshots are nested: every later one contains
+everything the earlier ones did. **Across sessions they are not.** A fresh
+Colab session starts from an empty database unless `restore_tracking` is run
+first, so the snapshots left by different sessions are disjoint, and Drive ends
+up holding several complete-but-different databases side by side.
+
+Cell 3 therefore picks the **largest** snapshot, not the most recently modified
+one. Size is a fair proxy for completeness when every file is a full copy, and
+modification time is not trustworthy here: Drive's FUSE layer does not promise
+that `mtime` tracks write order, and a re-upload or a re-sync can leave an old
+snapshot looking like the newest thing on the mount. Confirm the choice in
+cells 6-7 rather than assuming it — they show which runs are in the database and
+how many epochs each logged, which is what a wrong pick looks like.
+
+If you ran the end-of-session `sync_tracking` from notebook 02,
+`MyDrive/ecg/mlflow.db` is in the listing too and is found the same way.
 
 ## The one rule: copy it off Drive before opening it
 
@@ -108,10 +119,15 @@ md(
     """
 ## 3. Find the snapshots
 
-Every copy of `mlflow.db` anywhere under `MyDrive/ecg`, newest first. The top
-row is the one to take.
+Every copy of `mlflow.db` anywhere under `MyDrive/ecg`, **largest first**. The
+top row is the one to take; see the note above for why size rather than time.
 
-A study that is still running keeps producing newer snapshots, so re-run cells
+Read the two columns together. Rows of a similar size with timestamps minutes
+apart are one session's successive snapshots, and the largest of them is the
+one you want. A row that is a different size *and* hours or days away is a
+different session, holding different runs.
+
+A study that is still running keeps producing larger snapshots, so re-run cells
 3-4 to pick up the epochs written since.
 """
 )
@@ -122,7 +138,12 @@ import datetime as dt
 
 import pandas as pd
 
-found = sorted(ECG.rglob("mlflow.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+from ecg.training.checkpoints import fullest_tracking
+
+# Listed largest first, and the pick is fullest_tracking's -- the same rule
+# notebook 02 restores with, so the two cannot disagree about which snapshot is
+# the current one. Size, not mtime: see the note at the top.
+found = sorted(ECG.rglob("mlflow.db"), key=lambda p: p.stat().st_size, reverse=True)
 assert found, f"no mlflow.db anywhere under {ECG}; has a study run yet?"
 
 snapshots = pd.DataFrame(
@@ -137,9 +158,9 @@ snapshots = pd.DataFrame(
 )
 print(snapshots.to_string(index=False))
 
-SOURCE_DB = found[0]
+SOURCE_DB = fullest_tracking(ECG)
 print()
-print(f"newest: {SOURCE_DB}")
+print(f"largest: {SOURCE_DB}")
 """
 )
 
@@ -152,7 +173,11 @@ is writing to, and the backup API would have to *open* the file on the mount,
 which is the thing we are avoiding.
 
 Set `SOURCE_DB` by hand above this line if you want a snapshot other than the
-newest.
+largest — a `path` from the table is enough:
+
+```python
+SOURCE_DB = ECG / "runs/study/sup-conv-ssl-f020-s2/mlflow.db"
+```
 """
 )
 
@@ -172,6 +197,12 @@ md(
 A `q()` helper for free-form SQL, then the four tables worth knowing:
 `experiments`, `runs`, `metrics` (one row per key per epoch) and `params` (one
 row per hyperparameter, written once at run start).
+
+**This is also where you check cell 3 picked the right snapshot.** The run
+listing carries `started` and `epochs`: the runs of one session share a
+contiguous block of start times, and `epochs` is how many the run actually
+logged. A pretraining run you know ran 600 epochs showing 50 here means this
+database is from an earlier session — go back to cell 3 and take another row.
 """
 )
 
@@ -214,6 +245,8 @@ print(
                r.status,
                datetime(r.start_time / 1000, 'unixepoch') AS started,
                ROUND((r.end_time - r.start_time) / 60000.0, 1) AS minutes,
+               (SELECT MAX(m.step) + 1 FROM metrics m
+                 WHERE m.run_uuid = r.run_uuid) AS epochs,
                (SELECT COUNT(*) FROM metrics m WHERE m.run_uuid = r.run_uuid) AS n_metrics
         FROM runs r
         JOIN experiments e ON e.experiment_id = r.experiment_id

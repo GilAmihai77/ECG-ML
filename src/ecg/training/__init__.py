@@ -8,6 +8,7 @@ be traced back to the settings that produced it.
 from __future__ import annotations
 
 from ecg.training.checkpoints import (
+    fullest_tracking,
     load_checkpoint,
     load_encoder_weights,
     restore_tracking,
@@ -39,6 +40,7 @@ __all__ = [
     "TrainingResult",
     "evaluate",
     "evaluate_classifier",
+    "fullest_tracking",
     "load_checkpoint",
     "load_encoder_weights",
     "predict",

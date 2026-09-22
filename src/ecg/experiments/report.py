@@ -33,6 +33,7 @@ row is reported alongside so the difference is visible rather than assumed.
 from __future__ import annotations
 
 import sqlite3
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -580,17 +581,22 @@ def training_history(
         experiment: Restrict to this experiment name. ``None`` reads all.
 
     Returns:
-        Long-form: ``run``, ``key``, ``step``, ``value``.
+        Long-form: ``run``, ``key``, ``step``, ``value``. One run per name --
+        see :func:`_keep_latest_per_name`.
 
     Raises:
         FileNotFoundError: If the database does not exist.
+
+    Warns:
+        RuntimeWarning: If a run name matches more than one MLflow run.
     """
     path = Path(database)
     if not path.exists():
         raise FileNotFoundError(f"no tracking database at {path}")
 
     query = """
-        SELECT r.name AS run, m.key, m.step, m.value
+        SELECT r.name AS run, r.run_uuid AS run_id, r.start_time AS started,
+               m.key, m.step, m.value
         FROM metrics m
         JOIN runs r ON r.run_uuid = m.run_uuid
         JOIN experiments e ON e.experiment_id = r.experiment_id
@@ -600,13 +606,60 @@ def training_history(
     clause = "AND e.name = ?" if experiment else ""
     connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
     try:
-        return pd.read_sql(
+        frame = pd.read_sql(
             query.format(clause=clause),
             connection,
             params=(experiment,) if experiment else None,
         )
     finally:
         connection.close()
+    return _keep_latest_per_name(frame)
+
+
+def _keep_latest_per_name(frame: pd.DataFrame) -> pd.DataFrame:
+    """Reduce a history frame to one MLflow run per run name.
+
+    MLflow does not require run names to be unique, and they stop being unique
+    the moment one database holds more than one session -- which is exactly what
+    :func:`ecg.training.checkpoints.restore_tracking` makes possible. Because
+    :func:`curve` matches on the name alone, a duplicate is not a cosmetic
+    problem: a 50-epoch run and a 600-epoch rerun of the same arm would splice
+    into one series and plot as a single jagged curve, with no error anywhere.
+
+    Args:
+        frame: Rows carrying ``run``, ``run_id`` and ``started`` alongside the
+            metric columns.
+
+    Returns:
+        The documented columns only, keeping each name's most recently started
+        run.
+
+    Warns:
+        RuntimeWarning: If any name matched more than one run, naming them. The
+            older runs stay in the database; read them by ``run_uuid``.
+    """
+    columns = ["run", "key", "step", "value"]
+    identity = frame[["run", "run_id", "started"]].drop_duplicates()
+    repeated = identity["run"].duplicated(keep=False)
+    if not repeated.any():
+        return frame[columns]
+
+    names = sorted(identity.loc[repeated, "run"].unique())
+    shown = ", ".join(names[:4]) + (", ..." if len(names) > 4 else "")
+    warnings.warn(
+        f"{len(names)} run name(s) appear more than once in this tracking "
+        f"database ({shown}); keeping the most recently started run for each. "
+        "This is what a database holding several sessions looks like -- the "
+        "older runs are still there, addressable by run_uuid.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    latest = (
+        identity.sort_values("started")
+        .drop_duplicates("run", keep="last")
+        .set_index("run")["run_id"]
+    )
+    return frame.loc[frame["run_id"] == frame["run"].map(latest), columns]
 
 
 def curve(history: pd.DataFrame, run: str, key: str) -> pd.Series:

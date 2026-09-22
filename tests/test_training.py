@@ -9,7 +9,9 @@ fail in any way at all without taking the training run with it.
 from __future__ import annotations
 
 import math
+import os
 import sqlite3
+import time
 import warnings
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from ecg.models.config import ModelConfig, SslConfig
 from ecg.models.encoder import build_classifier
 from ecg.models.ssl import build_pretrainer
 from ecg.training.checkpoints import (
+    fullest_tracking,
     load_checkpoint,
     load_encoder_weights,
     restore_tracking,
@@ -208,6 +211,51 @@ class TestTrackingSync:
     def test_missing_source_is_loud_on_restore(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError, match="no tracking database"):
             restore_tracking(tmp_path / "absent.db", tmp_path / "out.db")
+
+
+class TestFullestTracking:
+    """Which snapshot a reconnected session should resume from."""
+
+    def _snapshot(self, path: Path, rows: int) -> Path:
+        """Write a tracking database holding ``rows`` metric rows."""
+        local = _tracking_db(path.parent / "source.db", rows=rows)
+        synced = sync_tracking(local, path)
+        assert synced is not None
+        local.unlink()
+        return synced
+
+    def test_no_snapshot_is_not_an_error(self, tmp_path: Path) -> None:
+        """The first session of all has nothing to resume, and says so."""
+        assert fullest_tracking(tmp_path) is None
+
+    def test_it_finds_snapshots_nested_under_run_directories(
+        self, tmp_path: Path
+    ) -> None:
+        only = self._snapshot(tmp_path / "study" / "sup-linear-f020" / "mlflow.db", 4)
+        assert fullest_tracking(tmp_path) == only
+
+    def test_the_largest_wins_over_the_most_recent(self, tmp_path: Path) -> None:
+        """The failure this exists to prevent.
+
+        A session's snapshots grow monotonically, so within one session either
+        rule agrees. Across sessions they do not: a small database written later
+        is a *different* session, not a fuller one, and taking it silently hides
+        every epoch the long session logged.
+        """
+        full = self._snapshot(tmp_path / "long-session" / "mlflow.db", 600)
+        recent = self._snapshot(tmp_path / "short-session" / "mlflow.db", 50)
+        os.utime(recent, (time.time() + 60, time.time() + 60))
+
+        assert recent.stat().st_mtime > full.stat().st_mtime
+        assert fullest_tracking(tmp_path) == full
+
+    def test_it_never_opens_a_database(self, tmp_path: Path, monkeypatch) -> None:
+        """Opening one on a Drive mount is what corrupts it."""
+        self._snapshot(tmp_path / "study" / "mlflow.db", 4)
+        monkeypatch.setattr(
+            sqlite3, "connect", lambda *a, **k: pytest.fail("opened a database")
+        )
+        assert fullest_tracking(tmp_path) is not None
 
 
 class TestTracker:
@@ -479,13 +527,25 @@ class TestPretrainingBudget:
         assert (restored.ssl_epochs, restored.checkpoint_every) == (0, 1)
 
 
-def _tracking_db(path: Path) -> Path:
-    """A small SQLite file standing in for the MLflow tracking database."""
+def _tracking_db(path: Path, rows: int = 1) -> Path:
+    """A small SQLite file standing in for the MLflow tracking database.
+
+    Args:
+        path: Where to write it.
+        rows: How many metric rows to insert. More rows means a larger file,
+            which is what :func:`fullest_tracking` sorts on.
+
+    Returns:
+        The path written.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(str(path))
     try:
         connection.execute("CREATE TABLE metrics (key TEXT, value REAL)")
-        connection.execute("INSERT INTO metrics VALUES ('val_macro_auroc', 0.8)")
+        connection.executemany(
+            "INSERT INTO metrics VALUES ('val_macro_auroc', ?)",
+            [(0.8,)] * rows,
+        )
         connection.commit()
     finally:
         connection.close()

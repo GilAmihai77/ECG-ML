@@ -126,14 +126,28 @@ Re-run cells 1-4, then re-run the same training cell. **Finished runs are
 skipped**: each writes `result.json` when it completes, and the runner resumes
 from the one that was interrupted. You lose at most the run that was in flight.
 
+Cell 3 restores the tracking database, so do not skip it on a reconnect: the
+epochs logged before the disconnect are on Drive, but a session that starts
+without them writes its own database alongside instead of continuing that one.
+
+If the disconnect came *after* the study finished and you only want the results,
+skip the training cells entirely — everything from section 10 down rebuilds from
+`result.json` and the checkpoints on Drive. Sections 10-11 need only cells 1-3;
+section 13 also needs cell 4, since it reloads each checkpoint and re-scores.
+
 ## Where things live
 
 - **Checkpoints and results** go to Drive, under `MyDrive/ecg/runs/<run name>/`.
 - **MLflow's database stays on local disk** at `/content/mlruns/mlflow.db`, and
-  a consistent copy is written to Drive every epoch. This is deliberate:
-  SQLite's locking assumes POSIX semantics a Drive mount does not honour, so a
-  database living on Drive can corrupt silently. Cell 8 warns if you override
-  `--tracking` with a Drive path.
+  a consistent copy is written to Drive beside each checkpoint. This is
+  deliberate: SQLite's locking assumes POSIX semantics a Drive mount does not
+  honour, so a database living on Drive can corrupt silently. Cell 8 warns if
+  you override `--tracking` with a Drive path.
+- **Each copy is the whole database**, not that run's rows, so the largest
+  snapshot on Drive is the complete one. Cell 3 restores it before training, so
+  a reconnected session appends to the same history instead of opening a second,
+  disjoint database. Without that step every disconnect leaves another
+  complete-looking file on Drive and no way to tell them apart later.
 """
 )
 
@@ -182,6 +196,10 @@ RUNS.mkdir(parents=True, exist_ok=True)
 LOCAL = Path("/content/data")
 STORE = LOCAL / "store_100hz"
 METADATA = LOCAL / "ptbxl"
+
+# MLflow's database, on local disk for the reasons above. Cell 3 seeds it from
+# the fullest snapshot on Drive so this session continues the previous one.
+TRACKING = Path("/content/mlruns/mlflow.db")
 
 # Replicate seeds, read by both the dry run and the study so the two cannot
 # describe different studies. Every experiment runs once per seed and is
@@ -248,6 +266,23 @@ importlib.invalidate_caches()
 import ecg
 
 print("ecg", ecg.__version__, "from", ecg.__file__)
+
+# Continue the previous session's tracking database rather than starting a
+# second one beside it. A reconnected Colab session gets an empty local disk, so
+# without this every disconnect splits the study's history into another file --
+# each internally consistent, none complete, and nothing anywhere says which is
+# which. Restoring first means one database accumulates across sessions.
+#
+# Safe on the first run of all: there is nothing to restore and it says so.
+from ecg.training.checkpoints import fullest_tracking, restore_tracking
+
+previous = fullest_tracking(RUNS)
+if previous is None:
+    print(f"tracking: no snapshot under {{RUNS}} yet, starting a new database")
+else:
+    restore_tracking(previous, TRACKING)
+    size = TRACKING.stat().st_size / 1e6
+    print(f"tracking: restored {{previous.relative_to(ECG)}} ({{size:.1f}} MB)")
 """
 )
 
@@ -422,7 +457,7 @@ code(
     """
 !ecg-run --plan ablation \\
     --store "$STORE" --metadata "$METADATA" \\
-    --output "$RUNS/ablation" --tracking /content/mlruns/mlflow.db \\
+    --output "$RUNS/ablation" --tracking "$TRACKING" \\
     --experiment ecg-ablation \\
     --mask-ratios 0.3 0.5 0.7 --fractions 0.2 --epochs 30 --seeds 0
 
@@ -489,7 +524,7 @@ code(
 # default for a selection plan.
 !ecg-run --plan ssl-budget \\
     --store "$STORE" --metadata "$METADATA" \\
-    --output "$RUNS/ssl_budget" --tracking /content/mlruns/mlflow.db \\
+    --output "$RUNS/ssl_budget" --tracking "$TRACKING" \\
     --experiment ecg-ssl-budget --variant $VARIANT \\
     --mask-ratio $MASK_RATIO --mask-span 2 \\
     --ssl-budgets 100 200 400 600 \\
@@ -579,7 +614,7 @@ code(
 # seeds with honest pretraining: SEEDS = "0 1 2" costs less and claims less.
 !ecg-run \\
     --store "$STORE" --metadata "$METADATA" \\
-    --output "$RUNS/study" --tracking /content/mlruns/mlflow.db \\
+    --output "$RUNS/study" --tracking "$TRACKING" \\
     --experiment ecg-ssl --variant $VARIANT \\
     --mask-ratio $MASK_RATIO --mask-span 2 \\
     --fractions 0.2 0.5 1.0 --seeds $SEEDS \\
@@ -701,22 +736,32 @@ md(
     """
 ## 12. Browsing the MLflow runs
 
-The database is at `/content/mlruns/mlflow.db` with a per-epoch copy in each
-run's output directory on Drive. To browse it locally, download the copy from
-the last completed run and point the UI at it:
+The database is at `/content/mlruns/mlflow.db`, with a copy beside each
+checkpoint on Drive. **Notebook `03_mlflow_explore.ipynb` is the place to read
+it** — it picks the right snapshot, copies it off the mount, and lists every run
+with the epochs it logged. Or download the copy and point the UI at it:
 
 ```bash
 mlflow ui --backend-store-uri sqlite:///mlflow.db
 ```
 
-To keep the tracking database across sessions, copy it to Drive once at the end
-of a session and restore it at the start of the next:
+Cell 3 already restores the fullest snapshot at session start, so these runs
+continue the previous session's rather than starting a second database. Two
+consequences worth knowing:
+
+- The database grows across sessions and is never pruned. That is the intent —
+  it is the study's whole history.
+- Re-running a run that already logged once puts **two** MLflow runs of the same
+  name in there; MLflow does not require names to be unique. `training_history`
+  keeps the most recently started of each and warns, because matching on the
+  name alone would otherwise splice two runs' epochs into one curve.
+
+To snapshot the database without waiting for the next checkpoint:
 
 ```python
-from ecg.training.checkpoints import restore_tracking, sync_tracking
+from ecg.training.checkpoints import sync_tracking
 
-sync_tracking("/content/mlruns/mlflow.db", ECG / "mlflow.db")      # end of session
-restore_tracking(ECG / "mlflow.db", "/content/mlruns/mlflow.db")   # start of next
+sync_tracking(TRACKING, ECG / "mlflow.db")
 ```
 """
 )

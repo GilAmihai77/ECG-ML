@@ -179,6 +179,39 @@ def sync_tracking(source_db: str | Path, destination: str | Path) -> Path | None
     return target
 
 
+def fullest_tracking(root: str | Path) -> Path | None:
+    """Find the most complete tracking snapshot beneath a directory.
+
+    Every copy written by :func:`sync_tracking` is a copy of the *whole*
+    database, not of one run's rows, so the largest file is the one holding the
+    most runs.
+
+    Size rather than modification time, deliberately. Within a session the
+    snapshots grow monotonically and either rule agrees. Across sessions they
+    do not: a reconnected Colab session starts from an empty database unless
+    :func:`restore_tracking` runs first, so Drive accumulates several
+    complete-but-disjoint databases, and the newest is merely the last session's
+    -- not the fullest. Modification time is the weaker signal anyway, because
+    Drive's FUSE layer does not promise it tracks write order and a re-upload
+    can leave an old snapshot looking like the newest file on the mount.
+
+    Only ``stat`` is called: nothing here opens a database on the mount, which
+    is what corrupts one.
+
+    Args:
+        root: Directory searched recursively.
+
+    Returns:
+        The largest ``mlflow.db`` beneath ``root``, most recent breaking a tie,
+        or ``None`` if there is none.
+    """
+    found = sorted(
+        Path(root).rglob(TRACKING_DB),
+        key=lambda path: (path.stat().st_size, path.stat().st_mtime),
+    )
+    return found[-1] if found else None
+
+
 def restore_tracking(source: str | Path, destination: str | Path) -> Path:
     """Copy a synced tracking database back for a resumed session.
 
