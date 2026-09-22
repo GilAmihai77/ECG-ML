@@ -374,6 +374,13 @@ crossing point that is an artefact of two arbitrary scales.
 
 `val_loss` and `train_loss` are the honest overfitting diagnostic. Neither
 selects anything — selection is `val_macro_auroc` and only that.
+
+The two kinds of run are plotted separately because they share no axis. A
+supervised run logs BCE loss over `--epochs`; a pretraining run logs
+reconstruction MSE over `--ssl-epochs`, which is an order of magnitude longer.
+The pretraining panel is where you confirm the SSL budget that actually ran —
+if it ends at 50 when you asked for 600, you are reading an older session's
+database, not a truncated run.
 """
 )
 
@@ -381,8 +388,15 @@ code(
     """
 import matplotlib.pyplot as plt
 
-runs = sorted(history["run"].unique())
-chosen = runs[:5]  # edit: at most ~5 lines stay readable on one panel
+# Split by what each run logged, rather than taking the first five names in the
+# database. "pretrain-" sorts before "sup-", so a plain sorted()[:5] picks five
+# pretraining runs and both supervised panels come back empty -- pretraining
+# logs reconstruction loss and nothing else.
+supervised = sorted(history.loc[history["key"] == "val_macro_auroc", "run"].unique())
+pretrains = sorted(history.loc[history["key"] == "holdout_loss", "run"].unique())
+print(f"{len(supervised)} supervised runs, {len(pretrains)} pretraining runs")
+
+chosen = supervised[:5]  # edit: at most ~5 lines stay readable on one panel
 print("plotting:", chosen)
 
 plot_training_curves(
@@ -399,6 +413,17 @@ plot_training_curves(
     ylabels=("macro AUROC (val) -- the selection metric", "macro F1 (val)"),
     title="Validation metrics",
 )
+
+# The pretraining runs on their own axes: a reconstruction MSE and a BCE loss
+# share no scale, and the x-axis runs to the SSL budget rather than to --epochs.
+if pretrains:
+    plot_training_curves(
+        history,
+        pretrains[:5],
+        keys=("ssl_loss", "holdout_loss"),
+        ylabels=("reconstruction MSE (pool)", "reconstruction MSE (holdout)"),
+        title="Pretraining",
+    )
 plt.show()
 """
 )
@@ -419,6 +444,11 @@ integrity rule 2 forbids.
 `aggfunc="last"` is not decoration. The selected epoch holds two rows for each
 `val_macro_*` key (see cell 6), and the default `mean` would quietly average
 them — reporting a number that appears in neither MLflow nor `result.json`.
+
+**Supervised runs only.** Pretraining is selected on holdout reconstruction
+loss and logs no `val_macro_auroc` at all, so it has no row here; the cell names
+the runs it left out rather than dropping them quietly. Selection metrics for
+pretraining are in section 8's third figure.
 """
 )
 
@@ -427,8 +457,22 @@ code(
 wide = history.pivot_table(
     index=["run", "step"], columns="key", values="value", aggfunc="last"
 )
+assert "val_macro_auroc" in wide, "no supervised runs in this database"
 
-best = wide.loc[wide.groupby("run")["val_macro_auroc"].idxmax()]
+# Supervised runs only, and the dropna() is what makes that true. Pretraining
+# never logs val_macro_auroc -- it is selected on holdout reconstruction loss --
+# so its group is entirely NaN, idxmax returns NaN rather than an index label,
+# and .loc raises a KeyError naming every run at once.
+selected = wide["val_macro_auroc"].dropna().groupby("run").idxmax()
+
+# Named, not dropped in silence (integrity rule 8). Pretraining runs belong
+# here; anything else in this list logged no selection metric and is a run that
+# died before its first evaluation.
+unselectable = sorted(set(wide.index.get_level_values("run")) - set(selected.index))
+if unselectable:
+    print(f"no val_macro_auroc, so not in the table: {', '.join(unselectable)}")
+
+best = wide.loc[selected]
 best.index = best.index.set_names(["run", "epoch"])
 
 columns = [c for c in wide.columns if c.startswith(("val_macro", "test_macro"))]
