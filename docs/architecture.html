@@ -1,0 +1,549 @@
+<title>Two Stems, One Encoder</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+:root{
+  --ground:#EEF1F4;
+  --panel:#FFFFFF;
+  --ink:#0E151D;
+  --ink-2:#44525E;
+  --muted:#6F8090;
+  --rule:#D5DDE4;
+  --linear:#1B6E92;
+  --conv:#B4501F;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,Segoe UI,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#080C11;--panel:#111821;--ink:#E9F1F8;--ink-2:#AFC0CE;
+    --muted:#7D909F;--rule:#232F3B;--linear:#45C0F0;--conv:#FF9354;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#080C11;--panel:#111821;--ink:#E9F1F8;--ink-2:#AFC0CE;
+  --muted:#7D909F;--rule:#232F3B;--linear:#45C0F0;--conv:#FF9354;
+}
+
+body{background:var(--ground);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.6}
+.wrap{max-width:1760px;margin:0 auto;padding:32px 20px 60px;display:flex;flex-direction:column;gap:22px}
+
+.mast{display:flex;flex-direction:column;gap:10px}
+.eyebrow{font-family:var(--mono);font-size:11.5px;font-weight:500;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
+h1{font-family:var(--mono);font-weight:600;font-size:clamp(24px,3vw,34px);letter-spacing:-.02em;margin:0;line-height:1.1;text-wrap:balance}
+.standfirst{max-width:70ch;color:var(--ink-2);font-size:16px;margin:0}
+
+.chips{display:flex;flex-wrap:wrap;gap:7px}
+.chip{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);border:1px solid var(--rule);border-radius:2px;padding:4px 10px;background:var(--panel)}
+.chip.l{color:var(--linear);border-color:var(--linear)}
+.chip.c{color:var(--conv);border-color:var(--conv)}
+
+figure{margin:0;display:flex;flex-direction:column;gap:12px}
+.canvas{background:#0B1118;border:1px solid var(--rule);border-radius:4px;overflow-x:auto}
+.canvas svg{display:block;width:100%;min-width:960px;height:auto}
+figcaption{font-size:14px;color:var(--muted);max-width:78ch}
+figcaption b{color:var(--ink-2);font-weight:600}
+code{font-family:var(--mono);font-size:.9em;color:var(--ink-2)}
+
+/* The figure commits to one dark instrument palette in both page themes, so
+   lane contrast never depends on the viewer's setting or the projector's. */
+.bg{fill:#0B1118}
+.bx-l{fill:#0D2D3D;stroke:#45C0F0;stroke-width:3}
+.bx-c{fill:#34200E;stroke:#FF9354;stroke-width:3}
+.bx-s{fill:#151E29;stroke:#3C5065;stroke-width:3}
+.bx-n{fill:#101821;stroke:#2C3B4A;stroke-width:2.4}
+.t{font-family:"IBM Plex Mono",monospace;font-size:24px;fill:#E9F1F8}
+.t-m{font-family:"IBM Plex Mono",monospace;font-size:22px;fill:#E9F1F8}
+.t-s{font-family:"IBM Plex Mono",monospace;font-size:19px;fill:#93A8B9}
+.t-o{font-family:"IBM Plex Mono",monospace;font-size:20px}
+.o-l{fill:#8FDCFA}
+.o-c{fill:#FFC79E}
+.o-s{fill:#A8BDD1}
+.hd{font-family:"IBM Plex Mono",monospace;font-size:23px;font-weight:600;letter-spacing:.14em}
+.hd-l{fill:#45C0F0}
+.hd-c{fill:#FF9354}
+.hd-s{fill:#8FA8BF}
+.pill{fill:#101821;stroke:#2C3B4A;stroke-width:2}
+.ln-l{stroke:#45C0F0;stroke-width:3;fill:none}
+.ln-c{stroke:#FF9354;stroke-width:3;fill:none}
+.ln-g{stroke:#5E778F;stroke-width:3;fill:none}
+.div{stroke:#2C3B4A;stroke-width:1.8}
+.ah-l{fill:#45C0F0}
+.ah-c{fill:#FF9354}
+.ah-g{fill:#5E778F}
+
+/* slide 2 / 3 additions: SSL is a third axis, so it gets its own hue */
+.o-ssl{fill:#4FD6A6}
+.hd-ssl{fill:#4FD6A6}
+.bx-ssl{fill:#0F2C24;stroke:#4FD6A6;stroke-width:3}
+.bx-warn{fill:#332114;stroke:#FFB067;stroke-width:3}
+.t-xl{font-family:"IBM Plex Mono",monospace;font-size:44px;font-weight:600;fill:#E9F1F8}
+.t-arm{font-family:"IBM Plex Mono",monospace;font-size:52px;font-weight:600}
+.t-lg{font-family:"IBM Plex Mono",monospace;font-size:30px;fill:#E9F1F8}
+.t-sub{font-family:"IBM Plex Mono",monospace;font-size:24px;fill:#93A8B9}
+.zebra{fill:#101821}
+.rule-h{stroke:#41556B;stroke-width:2.4}
+.rule-r{stroke:#222E3A;stroke-width:1.6}
+.dash{fill:#54687C}
+
+/* slide 4 chart marks: darkened steps of the deck hues so the fills sit inside
+   the dark-mode OKLCH lightness band (validated, all six checks pass) */
+.grid{stroke:#1C2733;stroke-width:1.4;fill:none}
+.axis{stroke:#33455A;stroke-width:2;fill:none}
+.t-ax{font-family:"IBM Plex Mono",monospace;font-size:20px;fill:#7D909F}
+.t-val{font-family:"IBM Plex Mono",monospace;font-size:20px;fill:#C7D4DE}
+
+/* deck */
+.slide{display:flex;flex-direction:column;gap:12px}
+.slideno{font-family:var(--mono);font-size:11.5px;font-weight:500;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
+.deck{display:flex;flex-direction:column;gap:46px}
+</style>
+
+<div class="wrap">
+
+  <header class="mast">
+    <div class="eyebrow">PTB-XL · arms A–D · 4 slides · 16:9</div>
+    <h1>Two Stems, One Encoder</h1>
+    <p class="standfirst">Four arms, one graph. The signal splits into two patch embedders, rejoins as twenty tokens of width 128, and everything downstream is the same module with the same weights shape. Exactly one lane changes between arms. Slides 3 and 4 report the outcome: SSL lifts the conv stem and sets the linear one back.</p>
+    <div class="chips">
+      <span class="chip">12 leads × 1000 samples @ 100 Hz</span>
+      <span class="chip">20 tokens × 500 ms</span>
+      <span class="chip">d_model 128</span>
+      <span class="chip l">linear 76,928</span>
+      <span class="chip c">conv 74,944</span>
+      <span class="chip">Δ 2.6%</span>
+    </div>
+  </header>
+
+  <div class="deck">
+
+  <section class="slide">
+  <div class="slideno">Slide 1 — architecture</div>
+  <figure>
+    <div class="canvas">
+      <svg viewBox="0 0 1920 1080" role="img" aria-label="Landscape 16 by 9 diagram of the ECG model pipeline. Raw signal of shape batch by 12 by 1000 splits into two parallel lanes. The upper linear lane patchifies into batch by 20 by 600 and applies one Linear 600 to 128, with a 50-sample receptive field and 76,928 parameters. The lower conv lane applies three strided Conv1d layers, 12 to 48 to 80 to 128, the first two followed by GroupNorm and GELU, with strides 5 by 5 by 2 and a 127-sample receptive field, totalling 74,944 parameters. Both lanes emit batch by 20 by 128 tokens, which enter a shared encoder of learned positions, dropout, four pre-norm Transformer blocks and a LayerNorm, totalling 796,805 parameters. The encoder output splits into a classifier head producing 5 logits and an SSL decoder producing a batch by 20 by 600 reconstruction.">
+        <defs>
+          <marker id="al" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-l"/></marker>
+          <marker id="ac" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-c"/></marker>
+          <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-g"/></marker>
+        </defs>
+
+        <rect class="bg" x="0" y="0" width="1920" height="1080"/>
+
+        <!-- ============ input ============ -->
+        <rect class="bx-n" x="30" y="430" width="195" height="200" rx="4"/>
+        <text class="t" x="128" y="482" text-anchor="middle">raw ECG</text>
+        <text class="t-o o-s" x="128" y="520" text-anchor="middle">(B, 12, 1000)</text>
+        <text class="t-s" x="128" y="558" text-anchor="middle">12 leads</text>
+        <text class="t-s" x="128" y="592" text-anchor="middle">10 s @ 100 Hz</text>
+
+        <!-- split bus -->
+        <path class="ln-g" d="M225,530 L248,530 M248,230 L248,830"/>
+        <path class="ln-l" d="M248,230 L266,230" marker-end="url(#al)"/>
+        <path class="ln-c" d="M248,830 L266,830" marker-end="url(#ac)"/>
+
+        <!-- ============ linear lane ============ -->
+        <text class="hd hd-l" x="266" y="100">ARM A / C · LINEAR EMBEDDER</text>
+
+        <rect class="bx-l" x="266" y="130" width="374" height="200" rx="4"/>
+        <text class="t" x="453" y="185" text-anchor="middle">patchify</text>
+        <text class="t-s" x="453" y="222" text-anchor="middle">lead-major flatten</text>
+        <text class="t-s" x="453" y="252" text-anchor="middle">12 × 50 samples</text>
+        <text class="t-o o-l" x="453" y="292" text-anchor="middle">→ (B, 20, 600)</text>
+
+        <path class="ln-l" d="M640,230 L690,230" marker-end="url(#al)"/>
+
+        <rect class="bx-l" x="690" y="130" width="374" height="200" rx="4"/>
+        <text class="t" x="877" y="185" text-anchor="middle">nn.Linear(600 → 128)</text>
+        <text class="t-s" x="877" y="222" text-anchor="middle">one matrix multiply</text>
+        <text class="t-s" x="877" y="252" text-anchor="middle">no nonlinearity</text>
+        <text class="t-o o-l" x="877" y="292" text-anchor="middle">→ (B, 20, 128)</text>
+
+        <rect class="pill" x="385" y="358" width="560" height="52" rx="26"/>
+        <text class="t-o o-s" x="665" y="391" text-anchor="middle">76,928 params · window 50 samples = 1 patch</text>
+
+        <!-- ============ conv lane ============ -->
+        <text class="hd hd-c" x="266" y="700">ARM B / D · CONV STEM</text>
+
+        <rect class="bx-c" x="266" y="730" width="248" height="200" rx="4"/>
+        <text class="t" x="390" y="785" text-anchor="middle">Conv1d(12 → 48)</text>
+        <text class="t-s" x="390" y="822" text-anchor="middle">k 7 · s 5 · p 1</text>
+        <text class="t-s" x="390" y="852" text-anchor="middle">GroupNorm(8) · GELU</text>
+        <text class="t-o o-c" x="390" y="892" text-anchor="middle">→ (B, 48, 200)</text>
+
+        <path class="ln-c" d="M514,830 L541,830" marker-end="url(#ac)"/>
+
+        <rect class="bx-c" x="541" y="730" width="248" height="200" rx="4"/>
+        <text class="t" x="665" y="785" text-anchor="middle">Conv1d(48 → 80)</text>
+        <text class="t-s" x="665" y="822" text-anchor="middle">k 5 · s 5 · p 0</text>
+        <text class="t-s" x="665" y="852" text-anchor="middle">GroupNorm(8) · GELU</text>
+        <text class="t-o o-c" x="665" y="892" text-anchor="middle">→ (B, 80, 40)</text>
+
+        <path class="ln-c" d="M789,830 L816,830" marker-end="url(#ac)"/>
+
+        <rect class="bx-c" x="816" y="730" width="248" height="200" rx="4"/>
+        <text class="t" x="940" y="785" text-anchor="middle">Conv1d(80 → 128)</text>
+        <text class="t-s" x="940" y="822" text-anchor="middle">k 5 · s 2 · p 2</text>
+        <text class="t-s" x="940" y="852" text-anchor="middle">no norm, no GELU</text>
+        <text class="t-o o-c" x="940" y="892" text-anchor="middle">→ (B, 128, 20)</text>
+
+        <text class="t-s" x="940" y="962" text-anchor="middle">transpose → (B, 20, 128)</text>
+
+        <rect class="pill" x="315" y="985" width="700" height="52" rx="26"/>
+        <text class="t-o o-s" x="665" y="1018" text-anchor="middle">74,944 params · strides 5×5×2 = 50 · window 127 samples</text>
+
+        <!-- ============ converge ============ -->
+        <path class="ln-l" d="M1064,230 L1090,230"/>
+        <path class="ln-c" d="M1064,830 L1090,830"/>
+        <path class="ln-g" d="M1090,230 L1090,830"/>
+        <path class="ln-g" d="M1090,530 L1112,530" marker-end="url(#ag)"/>
+
+        <!-- ============ shared encoder ============ -->
+        <rect class="bx-s" x="1112" y="310" width="400" height="440" rx="4"/>
+        <text class="hd hd-s" x="1312" y="353" text-anchor="middle">SHARED ENCODER</text>
+        <path class="div" d="M1128,372 L1496,372"/>
+
+        <text class="t-m" x="1312" y="410" text-anchor="middle">+ learned positions</text>
+        <text class="t-s" x="1312" y="438" text-anchor="middle">(1, 20, 128) · 2,560 params</text>
+        <path class="div" d="M1128,460 L1496,460"/>
+
+        <text class="t-m" x="1312" y="498" text-anchor="middle">Dropout(0.1)</text>
+        <path class="div" d="M1128,520 L1496,520"/>
+
+        <text class="t-m" x="1312" y="558" text-anchor="middle">4 × TransformerEncoderLayer</text>
+        <text class="t-s" x="1312" y="585" text-anchor="middle">pre-norm · 4 heads · d_ffn 512</text>
+        <text class="t-s" x="1312" y="610" text-anchor="middle">GELU · 793,344 params</text>
+        <path class="div" d="M1128,632 L1496,632"/>
+
+        <text class="t-m" x="1312" y="678" text-anchor="middle">LayerNorm(128)</text>
+        <text class="t-o o-s" x="1312" y="710" text-anchor="middle">→ (B, 20, 128)</text>
+
+        <!-- ============ heads ============ -->
+        <path class="ln-g" d="M1512,530 L1534,530 M1534,415 L1534,655"/>
+        <path class="ln-g" d="M1534,415 L1554,415" marker-end="url(#ag)"/>
+        <path class="ln-g" d="M1534,655 L1554,655" marker-end="url(#ag)"/>
+
+        <rect class="bx-n" x="1554" y="320" width="326" height="190" rx="4"/>
+        <text class="hd hd-s" x="1717" y="362" text-anchor="middle">CLASSIFIER</text>
+        <text class="t-s" x="1717" y="398" text-anchor="middle">mean over 20 tokens</text>
+        <text class="t-s" x="1717" y="426" text-anchor="middle">LayerNorm · Dropout</text>
+        <text class="t" x="1717" y="462" text-anchor="middle">Linear(128 → 5)</text>
+        <text class="t-o o-s" x="1717" y="492" text-anchor="middle">5 logits · sigmoid</text>
+
+        <rect class="bx-n" x="1554" y="560" width="326" height="190" rx="4"/>
+        <text class="hd hd-s" x="1717" y="602" text-anchor="middle">SSL DECODER</text>
+        <text class="t-s" x="1717" y="638" text-anchor="middle">one per token</text>
+        <text class="t" x="1717" y="674" text-anchor="middle">Linear(128 → 600)</text>
+        <text class="t-o o-s" x="1717" y="702" text-anchor="middle">→ (B, 20, 600)</text>
+        <text class="t-s" x="1717" y="730" text-anchor="middle">arms C/D, then discarded</text>
+      </svg>
+    </div>
+    <figcaption><b>The lanes are the experiment; everything else is held fixed.</b> The linear lane reaches tokens in two operations and each token sees exactly its own 500 ms. The conv lane takes three strided layers whose kernels are wider than their strides, so a token's window spans 127 samples — the overlap is the inductive bias under test, and a stem with <code>kernel = stride</code> would collapse into the linear projection. Both lanes emit <code>(B, 20, 128)</code>, so the 796,805 parameters to their right are identical in all four arms.</figcaption>
+  </figure>
+  </section>
+
+  <section class="slide">
+  <div class="slideno">Slide 2 — the four arms</div>
+  <figure>
+    <div class="canvas">
+      <svg viewBox="0 0 1920 1080" role="img" aria-label="Table of the four experimental arms. Arm A is a linear embedder with no pretraining, trained on 10,254 labelled records, isolating the supervised baseline for the linear embedder. Arm B is a conv stem with no pretraining on the same data, the supervised baseline for the conv stem. Arm C is a linear embedder with masked reconstruction pretraining on 17,418 unlabelled records, then fine-tuned on the same 10,254, testing whether SSL helps a linear embedder. Arm D is the conv stem with the same pretraining, testing whether SSL helps a conv stem. Three contrasts follow: A to B and C to D isolate the patch embedder at fixed pretraining; A to C and B to D isolate pretraining at fixed embedder; and the difference of differences, D minus B minus the quantity C minus A, is the interaction that asks whether the embedder changes what SSL is worth.">
+        <rect class="bg" x="0" y="0" width="1920" height="1080"/>
+
+        <text class="t-xl" x="80" y="88">The four arms</text>
+        <text class="t-sub" x="80" y="132">Two patch embedders × two pretraining regimes. Encoder, optimizer, budget and seeds identical across all four.</text>
+
+        <!-- header -->
+        <text class="hd hd-s" x="145" y="225" text-anchor="middle">ARM</text>
+        <text class="hd hd-s" x="230" y="225">EMBEDDER</text>
+        <text class="hd hd-s" x="540" y="225">PRETRAINING</text>
+        <text class="hd hd-s" x="1090" y="225" text-anchor="middle">LABELLED TRAIN</text>
+        <text class="hd hd-s" x="1240" y="225">WHAT IT ISOLATES</text>
+        <path class="rule-h" d="M80,245 L1840,245"/>
+
+        <!-- zebra + SSL grouping bar -->
+        <rect class="zebra" x="80" y="373" width="1760" height="128"/>
+        <rect class="zebra" x="80" y="629" width="1760" height="128"/>
+        <rect x="62" y="501" width="6" height="256" fill="#4FD6A6"/>
+
+        <!-- row A -->
+        <text class="t-arm hd-l" x="145" y="318" text-anchor="middle">A</text>
+        <text class="t-lg" x="230" y="301">Linear</text>
+        <text class="t-s" x="230" y="335">one Linear(600 → 128)</text>
+        <text class="t-lg" x="540" y="301" fill="#93A8B9">none</text>
+        <text class="t-s" x="540" y="335">random init</text>
+        <text class="t-lg" x="1090" y="301" text-anchor="middle">10,254</text>
+        <text class="t-s" x="1090" y="335" text-anchor="middle">records</text>
+        <text class="t-m" x="1240" y="317">supervised baseline, linear embedder</text>
+        <path class="rule-r" d="M80,373 L1840,373"/>
+
+        <!-- row B -->
+        <text class="t-arm hd-c" x="145" y="446" text-anchor="middle">B</text>
+        <text class="t-lg" x="230" y="429">Conv stem</text>
+        <text class="t-s" x="230" y="463">three strided conv layers</text>
+        <text class="t-lg" x="540" y="429" fill="#93A8B9">none</text>
+        <text class="t-s" x="540" y="463">random init</text>
+        <text class="t-lg" x="1090" y="429" text-anchor="middle">10,254</text>
+        <text class="t-s" x="1090" y="463" text-anchor="middle">records</text>
+        <text class="t-m" x="1240" y="445">supervised baseline, conv stem</text>
+        <path class="rule-r" d="M80,501 L1840,501"/>
+
+        <!-- row C -->
+        <text class="t-arm hd-l" x="145" y="574" text-anchor="middle">C</text>
+        <text class="t-lg" x="230" y="557">Linear</text>
+        <text class="t-s" x="230" y="591">one Linear(600 → 128)</text>
+        <text class="t-lg hd-ssl" x="540" y="557">masked reconstruction</text>
+        <text class="t-s" x="540" y="591">17,418 unlabelled records</text>
+        <text class="t-lg" x="1090" y="557" text-anchor="middle">10,254</text>
+        <text class="t-s" x="1090" y="591" text-anchor="middle">records</text>
+        <text class="t-m" x="1240" y="573">does SSL help a linear embedder</text>
+        <path class="rule-r" d="M80,629 L1840,629"/>
+
+        <!-- row D -->
+        <text class="t-arm hd-c" x="145" y="702" text-anchor="middle">D</text>
+        <text class="t-lg" x="230" y="685">Conv stem</text>
+        <text class="t-s" x="230" y="719">three strided conv layers</text>
+        <text class="t-lg hd-ssl" x="540" y="685">masked reconstruction</text>
+        <text class="t-s" x="540" y="719">17,418 unlabelled records</text>
+        <text class="t-lg" x="1090" y="685" text-anchor="middle">10,254</text>
+        <text class="t-s" x="1090" y="719" text-anchor="middle">records</text>
+        <text class="t-m" x="1240" y="701">does SSL help a conv stem</text>
+        <path class="rule-h" d="M80,757 L1840,757"/>
+
+        <!-- contrasts -->
+        <text class="hd hd-s" x="80" y="812">THE THREE CONTRASTS</text>
+
+        <rect class="bx-n" x="80" y="832" width="560" height="180" rx="4"/>
+        <text class="t-lg" x="360" y="900" text-anchor="middle">A → B   ·   C → D</text>
+        <text class="t-m" x="360" y="942" text-anchor="middle">the patch embedder,</text>
+        <text class="t-m" x="360" y="974" text-anchor="middle">at fixed pretraining</text>
+
+        <rect class="bx-n" x="680" y="832" width="560" height="180" rx="4"/>
+        <text class="t-lg" x="960" y="900" text-anchor="middle">A → C   ·   B → D</text>
+        <text class="t-m" x="960" y="942" text-anchor="middle">pretraining,</text>
+        <text class="t-m" x="960" y="974" text-anchor="middle">at fixed embedder</text>
+
+        <rect class="bx-ssl" x="1280" y="832" width="560" height="180" rx="4"/>
+        <text class="t-lg hd-ssl" x="1560" y="900" text-anchor="middle">(D − B) − (C − A)</text>
+        <text class="t-m" x="1560" y="942" text-anchor="middle">the interaction — does the</text>
+        <text class="t-m" x="1560" y="974" text-anchor="middle">embedder change SSL's value</text>
+      </svg>
+    </div>
+    <figcaption><b>Only the embedder and the pretraining move.</b> Arms A and B differ from C and D by the pretraining stage alone; A and C differ from B and D by the embedder alone. That is what makes the third box a legitimate question — the interaction term is only interpretable because nothing else varies between the four cells.</figcaption>
+  </figure>
+  </section>
+
+  <section class="slide">
+  <div class="slideno">Slide 3 — conv vs conv + SSL at 100% labels</div>
+  <figure>
+    <div class="canvas">
+      <svg viewBox="0 0 1920 1080" role="img" aria-label="Table comparing arm B, the conv stem trained from scratch, against arm D, the same conv stem with SSL pretraining, at 100 percent of labelled training data, scored by F1 per superclass on the test fold. NORM rises from 0.802 to 0.826, a gain of 0.024. MI rises from 0.605 to 0.624, a gain of 0.019. STTC rises from 0.705 to 0.726, a gain of 0.021. CD falls from 0.679 to 0.676, a loss of 0.003. HYP is unchanged at 0.445. The macro average rises from 0.647 to 0.659, a gain of 0.012. A bar chart column shows these differences to scale.">
+        <rect class="bg" x="0" y="0" width="1920" height="1080"/>
+
+        <text class="t-xl" x="140" y="95">Conv vs conv + SSL</text>
+        <text class="t-sub" x="140" y="142">Arm B against arm D at 100% labelled data (10,254 records). F1 per superclass, test fold.</text>
+        <text class="t-s" x="140" y="180">Thresholds selected on validation, applied unchanged to test. This export carries F1, precision and recall — no AUROC or PR-AUC.</text>
+
+        <!-- header -->
+        <text class="hd hd-s" x="140" y="268">SUPERCLASS</text>
+        <text class="hd hd-s" x="480" y="268" text-anchor="middle">TEST +</text>
+        <text class="t-m hd-c" x="710" y="268" text-anchor="middle">conv (B)</text>
+        <text class="t-m hd-ssl" x="980" y="268" text-anchor="middle">conv + SSL (D)</text>
+        <text class="t-m hd-s" x="1210" y="268" text-anchor="middle">Δ F1</text>
+        <text class="hd hd-s" x="1540" y="268" text-anchor="middle">Δ TO SCALE</text>
+        <path class="rule-h" d="M140,292 L1780,292"/>
+
+        <!-- zebra -->
+        <rect class="zebra" x="140" y="400" width="1640" height="108"/>
+        <rect class="zebra" x="140" y="616" width="1640" height="108"/>
+
+        <!-- zero line for the delta bars -->
+        <path class="rule-r" d="M1540,292 L1540,940"/>
+
+        <!-- NORM -->
+        <text class="t-lg" x="140" y="362">NORM</text>
+        <text class="t-m" x="480" y="362" text-anchor="middle">910</text>
+        <text class="t-lg" x="710" y="362" text-anchor="middle">0.802</text>
+        <text class="t-lg" x="980" y="362" text-anchor="middle">0.826</text>
+        <text class="t-lg o-ssl" x="1210" y="362" text-anchor="middle">+0.024</text>
+        <rect x="1540" y="332" width="160" height="28" fill="#4FD6A6"/>
+        <path class="rule-r" d="M140,400 L1780,400"/>
+
+        <!-- MI -->
+        <text class="t-lg" x="140" y="470">MI</text>
+        <text class="t-m" x="480" y="470" text-anchor="middle">550</text>
+        <text class="t-lg" x="710" y="470" text-anchor="middle">0.605</text>
+        <text class="t-lg" x="980" y="470" text-anchor="middle">0.624</text>
+        <text class="t-lg o-ssl" x="1210" y="470" text-anchor="middle">+0.019</text>
+        <rect x="1540" y="440" width="127" height="28" fill="#4FD6A6"/>
+        <path class="rule-r" d="M140,508 L1780,508"/>
+
+        <!-- STTC -->
+        <text class="t-lg" x="140" y="578">STTC</text>
+        <text class="t-m" x="480" y="578" text-anchor="middle">517</text>
+        <text class="t-lg" x="710" y="578" text-anchor="middle">0.705</text>
+        <text class="t-lg" x="980" y="578" text-anchor="middle">0.726</text>
+        <text class="t-lg o-ssl" x="1210" y="578" text-anchor="middle">+0.021</text>
+        <rect x="1540" y="548" width="140" height="28" fill="#4FD6A6"/>
+        <path class="rule-r" d="M140,616 L1780,616"/>
+
+        <!-- CD -->
+        <text class="t-lg" x="140" y="686">CD</text>
+        <text class="t-m" x="480" y="686" text-anchor="middle">449</text>
+        <text class="t-lg" x="710" y="686" text-anchor="middle">0.679</text>
+        <text class="t-lg" x="980" y="686" text-anchor="middle">0.676</text>
+        <text class="t-lg" x="1210" y="686" text-anchor="middle" fill="#FF7A6B">−0.003</text>
+        <rect x="1520" y="656" width="20" height="28" fill="#FF7A6B"/>
+        <path class="rule-r" d="M140,724 L1780,724"/>
+
+        <!-- HYP -->
+        <text class="t-lg" x="140" y="794">HYP</text>
+        <text class="t-m" x="480" y="794" text-anchor="middle">260</text>
+        <text class="t-lg" x="710" y="794" text-anchor="middle">0.445</text>
+        <text class="t-lg" x="980" y="794" text-anchor="middle">0.445</text>
+        <text class="t-lg dash" x="1210" y="794" text-anchor="middle">0.000</text>
+        <path class="rule-h" d="M140,832 L1780,832"/>
+
+        <!-- macro -->
+        <text class="t-lg" x="140" y="902">macro</text>
+        <text class="t-m" x="480" y="902" text-anchor="middle">2,105 recs</text>
+        <text class="t-lg" x="710" y="902" text-anchor="middle">0.647</text>
+        <text class="t-lg" x="980" y="902" text-anchor="middle">0.659</text>
+        <text class="t-lg o-ssl" x="1210" y="902" text-anchor="middle">+0.012</text>
+        <rect x="1540" y="872" width="80" height="28" fill="#4FD6A6"/>
+        <path class="rule-h" d="M140,940 L1780,940"/>
+
+        <text class="t-s" x="140" y="990">SSL wins on NORM, MI and STTC. CD is flat-to-down; HYP is unchanged in F1.</text>
+        <text class="t-s" x="140" y="1020">HYP hides a trade rather than a tie: precision 0.464 → 0.348, recall 0.427 → 0.619. Same F1, different model.</text>
+      </svg>
+    </div>
+    <figcaption><b>A small win, unevenly distributed.</b> Macro F1 moves +0.012 at full labels — real but modest, and carried almost entirely by the three commonest classes. Two things deserve saying out loud before this is presented: HYP's identical F1 masks a large swing from precision to recall, so SSL changed the rare-class decision boundary without improving it; and this is a single seed, so a 0.012 macro gap has no error bar attached to it yet. The label-efficiency story is stronger than this slide — SSL gains +0.027 macro F1 at 50% labels against +0.012 here — which is the direction the study's motivating asymmetry predicted.</figcaption>
+  </figure>
+  </section>
+
+  <section class="slide">
+  <div class="slideno">Slide 4 — the interaction</div>
+  <figure>
+    <div class="canvas">
+      <svg viewBox="0 0 1920 1080" role="img" aria-label="Two panels. Left: macro F1 on test against share of labelled training data, for four arms. Conv plus SSL is highest at every budget, rising 0.631, 0.650, 0.659. Conv from scratch rises 0.612, 0.623, 0.647. Linear from scratch rises 0.579, 0.625, 0.645. Linear plus SSL is lowest at every budget, 0.568, 0.594, 0.629. Right: the change in macro F1 caused by SSL pretraining, as diverging bars around zero. For the conv stem it is positive at every budget, plus 0.019, plus 0.027 and plus 0.012. For the linear embedder it is negative at every budget, minus 0.011, minus 0.031 and minus 0.016. The interaction term, D minus B minus the quantity C minus A, is positive at all three budgets: plus 0.030, plus 0.058 and plus 0.028.">
+        <rect class="bg" x="0" y="0" width="1920" height="1080"/>
+
+        <text class="t-xl" x="140" y="95">SSL helps the conv stem and hurts the linear one</text>
+        <text class="t-sub" x="140" y="142">Macro F1 on the test fold across the labelled-data ladder. Single seed, no error bars.</text>
+
+        <!-- ================= LEFT PANEL ================= -->
+        <text class="hd hd-s" x="140" y="205">MACRO F1</text>
+
+        <!-- legend -->
+        <g>
+          <path d="M140,236 L168,236" stroke="#DA7130" stroke-width="4" fill="none"/>
+          <circle cx="154" cy="236" r="6" fill="#DA7130"/>
+          <text class="t-ax" x="178" y="243">conv + SSL</text>
+
+          <path d="M320,236 L348,236" stroke="#DA7130" stroke-width="4" fill="none" stroke-dasharray="7 5"/>
+          <circle cx="334" cy="236" r="6" fill="#0B1118" stroke="#DA7130" stroke-width="3"/>
+          <text class="t-ax" x="358" y="243">conv</text>
+
+          <path d="M430,236 L458,236" stroke="#10A0CF" stroke-width="4" fill="none" stroke-dasharray="7 5"/>
+          <circle cx="444" cy="236" r="6" fill="#0B1118" stroke="#10A0CF" stroke-width="3"/>
+          <text class="t-ax" x="468" y="243">linear</text>
+
+          <path d="M562,236 L590,236" stroke="#10A0CF" stroke-width="4" fill="none"/>
+          <circle cx="576" cy="236" r="6" fill="#10A0CF"/>
+          <text class="t-ax" x="600" y="243">linear + SSL</text>
+        </g>
+
+        <!-- grid -->
+        <path class="grid" d="M230,269.8 L860,269.8"/>
+        <path class="grid" d="M230,439.1 L860,439.1"/>
+        <path class="grid" d="M230,608.4 L860,608.4"/>
+        <path class="grid" d="M230,777.7 L860,777.7"/>
+        <text class="t-ax" x="216" y="276" text-anchor="end">0.68</text>
+        <text class="t-ax" x="216" y="445" text-anchor="end">0.64</text>
+        <text class="t-ax" x="216" y="615" text-anchor="end">0.60</text>
+        <text class="t-ax" x="216" y="784" text-anchor="end">0.56</text>
+        <path class="axis" d="M230,820 L860,820"/>
+
+        <!-- conv + SSL (solid amber) -->
+        <polyline points="330,477.3 595,396.9 860,358.8" fill="none" stroke="#DA7130" stroke-width="4"/>
+        <circle cx="330" cy="477.3" r="7" fill="#DA7130" stroke="#0B1118" stroke-width="2"/>
+        <circle cx="595" cy="396.9" r="7" fill="#DA7130" stroke="#0B1118" stroke-width="2"/>
+        <circle cx="860" cy="358.8" r="7" fill="#DA7130" stroke="#0B1118" stroke-width="2"/>
+
+        <!-- conv (dashed amber) -->
+        <polyline points="330,557.7 595,511.2 860,409.6" fill="none" stroke="#DA7130" stroke-width="4" stroke-dasharray="7 5"/>
+        <circle cx="330" cy="557.7" r="7" fill="#0B1118" stroke="#DA7130" stroke-width="3"/>
+        <circle cx="595" cy="511.2" r="7" fill="#0B1118" stroke="#DA7130" stroke-width="3"/>
+        <circle cx="860" cy="409.6" r="7" fill="#0B1118" stroke="#DA7130" stroke-width="3"/>
+
+        <!-- linear (dashed cyan) -->
+        <polyline points="330,697.3 595,502.7 860,418.1" fill="none" stroke="#10A0CF" stroke-width="4" stroke-dasharray="7 5"/>
+        <circle cx="330" cy="697.3" r="7" fill="#0B1118" stroke="#10A0CF" stroke-width="3"/>
+        <circle cx="595" cy="502.7" r="7" fill="#0B1118" stroke="#10A0CF" stroke-width="3"/>
+        <circle cx="860" cy="418.1" r="7" fill="#0B1118" stroke="#10A0CF" stroke-width="3"/>
+
+        <!-- linear + SSL (solid cyan) -->
+        <polyline points="330,743.8 595,633.8 860,485.8" fill="none" stroke="#10A0CF" stroke-width="4"/>
+        <circle cx="330" cy="743.8" r="7" fill="#10A0CF" stroke="#0B1118" stroke-width="2"/>
+        <circle cx="595" cy="633.8" r="7" fill="#10A0CF" stroke="#0B1118" stroke-width="2"/>
+        <circle cx="860" cy="485.8" r="7" fill="#10A0CF" stroke="#0B1118" stroke-width="2"/>
+
+        <!-- endpoint values, nudged apart where the lines nearly meet -->
+        <text class="t-val" x="878" y="365">0.659</text>
+        <text class="t-val" x="878" y="404">0.647</text>
+        <text class="t-val" x="878" y="430">0.645</text>
+        <text class="t-val" x="878" y="492">0.629</text>
+
+        <text class="t-ax" x="330" y="858" text-anchor="middle">20%</text>
+        <text class="t-ax" x="595" y="858" text-anchor="middle">50%</text>
+        <text class="t-ax" x="860" y="858" text-anchor="middle">100%</text>
+        <text class="t-ax" x="545" y="898" text-anchor="middle">share of labelled training data</text>
+
+        <!-- ================= RIGHT PANEL ================= -->
+        <text class="hd hd-s" x="1120" y="205">Δ MACRO F1 FROM SSL PRETRAINING</text>
+
+        <path class="grid" d="M1120,407.5 L1780,407.5"/>
+        <path class="grid" d="M1120,682.5 L1780,682.5"/>
+        <text class="t-ax" x="1106" y="414" text-anchor="end">+0.02</text>
+        <text class="t-ax" x="1106" y="552" text-anchor="end">0</text>
+        <text class="t-ax" x="1106" y="689" text-anchor="end">−0.02</text>
+        <path class="axis" d="M1120,545 L1780,545"/>
+
+        <!-- 20% -->
+        <rect x="1158" y="414.4" width="70" height="130.6" rx="4" fill="#DA7130"/>
+        <rect x="1230" y="545" width="70" height="75.6" rx="4" fill="#10A0CF"/>
+        <text class="t-val" x="1193" y="404" text-anchor="middle">+0.019</text>
+        <text class="t-val" x="1265" y="645" text-anchor="middle">−0.011</text>
+
+        <!-- 50% -->
+        <rect x="1378" y="359.4" width="70" height="185.6" rx="4" fill="#DA7130"/>
+        <rect x="1450" y="545" width="70" height="213.1" rx="4" fill="#10A0CF"/>
+        <text class="t-val" x="1413" y="349" text-anchor="middle">+0.027</text>
+        <text class="t-val" x="1485" y="783" text-anchor="middle">−0.031</text>
+
+        <!-- 100% -->
+        <rect x="1598" y="462.5" width="70" height="82.5" rx="4" fill="#DA7130"/>
+        <rect x="1670" y="545" width="70" height="110" rx="4" fill="#10A0CF"/>
+        <text class="t-val" x="1633" y="452" text-anchor="middle">+0.012</text>
+        <text class="t-val" x="1705" y="679" text-anchor="middle">−0.016</text>
+
+        <text class="t-ax" x="1229" y="858" text-anchor="middle">20%</text>
+        <text class="t-ax" x="1449" y="858" text-anchor="middle">50%</text>
+        <text class="t-ax" x="1669" y="858" text-anchor="middle">100%</text>
+        <text class="t-ax" x="1449" y="898" text-anchor="middle">share of labelled training data</text>
+
+        <!-- ================= INTERACTION ================= -->
+        <rect class="bx-ssl" x="140" y="930" width="1640" height="92" rx="4"/>
+        <text class="t" x="170" y="972" fill="#4FD6A6">INTERACTION   (D − B) − (C − A)</text>
+        <text class="t" x="700" y="972">+0.030 at 20%        +0.058 at 50%        +0.028 at 100%</text>
+        <text class="t-s" x="170" y="1004">Positive at every label budget: the patch embedder changes what SSL pretraining is worth.</text>
+      </svg>
+    </div>
+    <figcaption><b>The interaction is the result, not the SSL main effect.</b> Averaged over embedders, SSL looks like noise; split by embedder it separates cleanly — positive for the conv stem at all three budgets, negative for the linear embedder at all three. That matches the pretraining curves this conversation opened with: the conv stem drove reconstruction MSE from 1.0 to 0.64 while the linear arm reached only 0.95, so the linear encoder arrived at fine-tuning barely changed from random init and its pretrained weights appear to be a worse starting point than a fresh one. Two honest caveats: this is a single seed, so none of these gaps carry an error bar; and the effect is not monotone in label budget — it peaks at 50% rather than at 20%, which a scarcity story alone does not predict.</figcaption>
+  </figure>
+  </section>
+
+  </div>
+
+</div>
