@@ -106,14 +106,14 @@ code{font-family:var(--mono);font-size:.9em;color:var(--ink-2)}
   <header class="mast">
     <div class="eyebrow">PTB-XL · arms A–D · 4 slides · 16:9</div>
     <h1>Two Stems, One Encoder</h1>
-    <p class="standfirst">Four arms, one graph. The signal splits into two patch embedders, rejoins as twenty tokens of width 128, and everything downstream is the same module with the same weights shape. Exactly one lane changes between arms. Slides 3 and 4 report the outcome: SSL lifts the conv stem and sets the linear one back.</p>
+    <p class="standfirst">Four arms, one graph. The signal splits into two patch embedders, rejoins as twenty tokens of width 256, and everything downstream is the same module with the same weights shape. Exactly one lane changes between arms. Slides 3 and 4 report the outcome: SSL lifts the conv stem and sets the linear one back.</p>
     <div class="chips">
       <span class="chip">12 leads × 1000 samples @ 100 Hz</span>
       <span class="chip">20 tokens × 500 ms</span>
-      <span class="chip">d_model 128</span>
-      <span class="chip l">linear 76,928</span>
-      <span class="chip c">conv 74,944</span>
-      <span class="chip">Δ 2.6%</span>
+      <span class="chip">d_model 256</span>
+      <span class="chip l">linear 153,856</span>
+      <span class="chip c">conv 150,640</span>
+      <span class="chip">Δ 2.1%</span>
     </div>
   </header>
 
@@ -123,7 +123,7 @@ code{font-family:var(--mono);font-size:.9em;color:var(--ink-2)}
   <div class="slideno">Slide 1 — architecture</div>
   <figure>
     <div class="canvas">
-      <svg viewBox="0 0 1920 1080" role="img" aria-label="Landscape 16 by 9 diagram of the ECG model pipeline. Raw signal of shape batch by 12 by 1000 splits into two parallel lanes. The upper linear lane patchifies into batch by 20 by 600 and applies one Linear 600 to 128, with a 50-sample receptive field and 76,928 parameters. The lower conv lane applies three strided Conv1d layers, 12 to 48 to 80 to 128, the first two followed by GroupNorm and GELU, with strides 5 by 5 by 2 and a 127-sample receptive field, totalling 74,944 parameters. Both lanes emit batch by 20 by 128 tokens, which enter a shared encoder of learned positions, dropout, four pre-norm Transformer blocks and a LayerNorm, totalling 796,805 parameters. The encoder output splits into a classifier head producing 5 logits and an SSL decoder producing a batch by 20 by 600 reconstruction.">
+      <svg viewBox="0 0 1920 1080" role="img" aria-label="Landscape 16 by 9 diagram of the ECG model pipeline. Raw signal of shape batch by 12 by 1000 splits into two parallel lanes. The upper linear lane patchifies into batch by 20 by 600 and applies one Linear 600 to 256, with a 50-sample receptive field and 153,856 parameters. The lower conv lane applies three strided Conv1d layers, 12 to 48 to 96 to 256, the first two followed by GroupNorm and GELU, with strides 5 by 5 by 2 and a 127-sample receptive field, totalling 150,640 parameters. Both lanes emit batch by 20 by 256 tokens, which enter a shared encoder of learned positions, dropout, four pre-norm Transformer blocks and a LayerNorm, totalling 3,166,469 parameters. The encoder output splits into a classifier head producing 5 logits and an SSL decoder producing a batch by 20 by 600 reconstruction.">
         <defs>
           <marker id="al" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-l"/></marker>
           <marker id="ac" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-c"/></marker>
@@ -156,13 +156,13 @@ code{font-family:var(--mono);font-size:.9em;color:var(--ink-2)}
         <path class="ln-l" d="M640,230 L690,230" marker-end="url(#al)"/>
 
         <rect class="bx-l" x="690" y="130" width="374" height="200" rx="4"/>
-        <text class="t" x="877" y="185" text-anchor="middle">nn.Linear(600 → 128)</text>
+        <text class="t" x="877" y="185" text-anchor="middle">nn.Linear(600 → 256)</text>
         <text class="t-s" x="877" y="222" text-anchor="middle">one matrix multiply</text>
         <text class="t-s" x="877" y="252" text-anchor="middle">no nonlinearity</text>
-        <text class="t-o o-l" x="877" y="292" text-anchor="middle">→ (B, 20, 128)</text>
+        <text class="t-o o-l" x="877" y="292" text-anchor="middle">→ (B, 20, 256)</text>
 
         <rect class="pill" x="385" y="358" width="560" height="52" rx="26"/>
-        <text class="t-o o-s" x="665" y="391" text-anchor="middle">76,928 params · window 50 samples = 1 patch</text>
+        <text class="t-o o-s" x="665" y="391" text-anchor="middle">153,856 params · window 50 samples = 1 patch</text>
 
         <!-- ============ conv lane ============ -->
         <text class="hd hd-c" x="266" y="700">ARM B / D · CONV STEM</text>
@@ -176,23 +176,23 @@ code{font-family:var(--mono);font-size:.9em;color:var(--ink-2)}
         <path class="ln-c" d="M514,830 L541,830" marker-end="url(#ac)"/>
 
         <rect class="bx-c" x="541" y="730" width="248" height="200" rx="4"/>
-        <text class="t" x="665" y="785" text-anchor="middle">Conv1d(48 → 80)</text>
+        <text class="t" x="665" y="785" text-anchor="middle">Conv1d(48 → 96)</text>
         <text class="t-s" x="665" y="822" text-anchor="middle">k 5 · s 5 · p 0</text>
         <text class="t-s" x="665" y="852" text-anchor="middle">GroupNorm(8) · GELU</text>
-        <text class="t-o o-c" x="665" y="892" text-anchor="middle">→ (B, 80, 40)</text>
+        <text class="t-o o-c" x="665" y="892" text-anchor="middle">→ (B, 96, 40)</text>
 
         <path class="ln-c" d="M789,830 L816,830" marker-end="url(#ac)"/>
 
         <rect class="bx-c" x="816" y="730" width="248" height="200" rx="4"/>
-        <text class="t" x="940" y="785" text-anchor="middle">Conv1d(80 → 128)</text>
+        <text class="t" x="940" y="785" text-anchor="middle">Conv1d(96 → 256)</text>
         <text class="t-s" x="940" y="822" text-anchor="middle">k 5 · s 2 · p 2</text>
         <text class="t-s" x="940" y="852" text-anchor="middle">no norm, no GELU</text>
-        <text class="t-o o-c" x="940" y="892" text-anchor="middle">→ (B, 128, 20)</text>
+        <text class="t-o o-c" x="940" y="892" text-anchor="middle">→ (B, 256, 20)</text>
 
-        <text class="t-s" x="940" y="962" text-anchor="middle">transpose → (B, 20, 128)</text>
+        <text class="t-s" x="940" y="962" text-anchor="middle">transpose → (B, 20, 256)</text>
 
         <rect class="pill" x="315" y="985" width="700" height="52" rx="26"/>
-        <text class="t-o o-s" x="665" y="1018" text-anchor="middle">74,944 params · strides 5×5×2 = 50 · window 127 samples</text>
+        <text class="t-o o-s" x="665" y="1018" text-anchor="middle">150,640 params · strides 5×5×2 = 50 · window 127 samples</text>
 
         <!-- ============ converge ============ -->
         <path class="ln-l" d="M1064,230 L1090,230"/>
@@ -206,19 +206,19 @@ code{font-family:var(--mono);font-size:.9em;color:var(--ink-2)}
         <path class="div" d="M1128,372 L1496,372"/>
 
         <text class="t-m" x="1312" y="410" text-anchor="middle">+ learned positions</text>
-        <text class="t-s" x="1312" y="438" text-anchor="middle">(1, 20, 128) · 2,560 params</text>
+        <text class="t-s" x="1312" y="438" text-anchor="middle">(1, 20, 256) · 5,120 params</text>
         <path class="div" d="M1128,460 L1496,460"/>
 
         <text class="t-m" x="1312" y="498" text-anchor="middle">Dropout(0.1)</text>
         <path class="div" d="M1128,520 L1496,520"/>
 
         <text class="t-m" x="1312" y="558" text-anchor="middle">4 × TransformerEncoderLayer</text>
-        <text class="t-s" x="1312" y="585" text-anchor="middle">pre-norm · 4 heads · d_ffn 512</text>
-        <text class="t-s" x="1312" y="610" text-anchor="middle">GELU · 793,344 params</text>
+        <text class="t-s" x="1312" y="585" text-anchor="middle">pre-norm · 8 heads · d_ffn 1024</text>
+        <text class="t-s" x="1312" y="610" text-anchor="middle">GELU · 3,159,552 params</text>
         <path class="div" d="M1128,632 L1496,632"/>
 
-        <text class="t-m" x="1312" y="678" text-anchor="middle">LayerNorm(128)</text>
-        <text class="t-o o-s" x="1312" y="710" text-anchor="middle">→ (B, 20, 128)</text>
+        <text class="t-m" x="1312" y="678" text-anchor="middle">LayerNorm(256)</text>
+        <text class="t-o o-s" x="1312" y="710" text-anchor="middle">→ (B, 20, 256)</text>
 
         <!-- ============ heads ============ -->
         <path class="ln-g" d="M1512,530 L1534,530 M1534,415 L1534,655"/>
@@ -229,18 +229,18 @@ code{font-family:var(--mono);font-size:.9em;color:var(--ink-2)}
         <text class="hd hd-s" x="1717" y="362" text-anchor="middle">CLASSIFIER</text>
         <text class="t-s" x="1717" y="398" text-anchor="middle">mean over 20 tokens</text>
         <text class="t-s" x="1717" y="426" text-anchor="middle">LayerNorm · Dropout</text>
-        <text class="t" x="1717" y="462" text-anchor="middle">Linear(128 → 5)</text>
+        <text class="t" x="1717" y="462" text-anchor="middle">Linear(256 → 5)</text>
         <text class="t-o o-s" x="1717" y="492" text-anchor="middle">5 logits · sigmoid</text>
 
         <rect class="bx-n" x="1554" y="560" width="326" height="190" rx="4"/>
         <text class="hd hd-s" x="1717" y="602" text-anchor="middle">SSL DECODER</text>
         <text class="t-s" x="1717" y="638" text-anchor="middle">one per token</text>
-        <text class="t" x="1717" y="674" text-anchor="middle">Linear(128 → 600)</text>
+        <text class="t" x="1717" y="674" text-anchor="middle">Linear(256 → 600)</text>
         <text class="t-o o-s" x="1717" y="702" text-anchor="middle">→ (B, 20, 600)</text>
         <text class="t-s" x="1717" y="730" text-anchor="middle">arms C/D, then discarded</text>
       </svg>
     </div>
-    <figcaption><b>The lanes are the experiment; everything else is held fixed.</b> The linear lane reaches tokens in two operations and each token sees exactly its own 500 ms. The conv lane takes three strided layers whose kernels are wider than their strides, so a token's window spans 127 samples — the overlap is the inductive bias under test, and a stem with <code>kernel = stride</code> would collapse into the linear projection. Both lanes emit <code>(B, 20, 128)</code>, so the 796,805 parameters to their right are identical in all four arms.</figcaption>
+    <figcaption><b>The lanes are the experiment; everything else is held fixed.</b> The linear lane reaches tokens in two operations and each token sees exactly its own 500 ms. The conv lane takes three strided layers whose kernels are wider than their strides, so a token's window spans 127 samples — the overlap is the inductive bias under test, and a stem with <code>kernel = stride</code> would collapse into the linear projection. Both lanes emit <code>(B, 20, 256)</code>, so the 3,166,469 parameters to their right are identical in all four arms.</figcaption>
   </figure>
   </section>
 
@@ -270,7 +270,7 @@ code{font-family:var(--mono);font-size:.9em;color:var(--ink-2)}
         <!-- row A -->
         <text class="t-arm hd-l" x="145" y="318" text-anchor="middle">A</text>
         <text class="t-lg" x="230" y="301">Linear</text>
-        <text class="t-s" x="230" y="335">one Linear(600 → 128)</text>
+        <text class="t-s" x="230" y="335">one Linear(600 → 256)</text>
         <text class="t-lg" x="540" y="301" fill="#93A8B9">none</text>
         <text class="t-s" x="540" y="335">random init</text>
         <text class="t-lg" x="1090" y="301" text-anchor="middle">10,254</text>
@@ -292,7 +292,7 @@ code{font-family:var(--mono);font-size:.9em;color:var(--ink-2)}
         <!-- row C -->
         <text class="t-arm hd-l" x="145" y="574" text-anchor="middle">C</text>
         <text class="t-lg" x="230" y="557">Linear</text>
-        <text class="t-s" x="230" y="591">one Linear(600 → 128)</text>
+        <text class="t-s" x="230" y="591">one Linear(600 → 256)</text>
         <text class="t-lg hd-ssl" x="540" y="557">masked reconstruction</text>
         <text class="t-s" x="540" y="591">17,418 unlabelled records</text>
         <text class="t-lg" x="1090" y="557" text-anchor="middle">10,254</text>
