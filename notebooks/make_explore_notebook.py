@@ -506,9 +506,23 @@ The tables above answer most questions faster than clicking. The UI is worth
 starting when you want to diff two runs side by side, or browse artifacts.
 
 It serves the **local copy**, so anything it writes — a schema migration, a
-deleted run — cannot reach Drive. If it refuses to start on a version mismatch,
-run `!mlflow db upgrade sqlite:////content/mlflow.db` and try again; that
-rewrites the local copy only.
+deleted run — cannot reach Drive.
+
+If it refuses to start on a schema version mismatch, read which way the
+mismatch runs before acting. MLflow reports both directions with the same
+"out-of-date database schema" wording, but only one is repairable:
+
+- **The database is older than this MLflow.** `!mlflow db upgrade
+  sqlite:////content/mlflow.db` migrates it, and rewrites the local copy only.
+- **The database is newer** — it was written by a later MLflow than the one
+  reading it. Then `mlflow db upgrade` cannot help: alembic raises `Can't
+  locate revision identified by ...`, because that revision does not exist in
+  this install's migration graph. Install the version that wrote it instead.
+
+This is why `mlflow` is pinned exactly in `pyproject.toml` rather than floored.
+Nothing above this section is affected either way: the tables come from
+`training_history`, which reads the file with plain read-only SQL and never
+consults the schema version.
 """
 )
 
@@ -553,6 +567,11 @@ browser and point the UI at it:
 ```bash
 mlflow ui --backend-store-uri sqlite:///mlflow.db
 ```
+
+Your machine needs the **same MLflow version Colab wrote with** for this to
+open — see the version note in section 11. `pip install -e .` gets it, since
+`pyproject.toml` pins it exactly. `training_history` needs no such thing; it
+reads the file with plain SQL.
 
 To let the **next** Colab session append to these same runs rather than start
 empty ones beside them, restore the snapshot before training:

@@ -12,6 +12,14 @@ checkpoints/
 *.ckpt
 *.pt
 
+# Tracking databases pulled off Drive to read locally, plus the sidecars
+# SQLite and sync_tracking leave beside them. Tens of MB of binary that the
+# study already keeps durably; the repo is not its home.
+*.db
+*.db.tmp
+*.db-wal
+*.db-shm
+
 # Python
 __pycache__/
 *.py[cod]

@@ -745,6 +745,13 @@ with the epochs it logged. Or download the copy and point the UI at it:
 mlflow ui --backend-store-uri sqlite:///mlflow.db
 ```
 
+That last one needs the **same MLflow version this notebook wrote with**, which
+is why `pyproject.toml` pins it exactly: MLflow stamps a schema revision into
+the database, and a database written by a newer MLflow cannot be opened by an
+older one — `mlflow db upgrade` fails, since the revision is missing from the
+older install's migration graph. Reading it with `training_history` sidesteps
+the whole question; that path is plain SQL.
+
 Cell 3 already restores the fullest snapshot at session start, so these runs
 continue the previous session's rather than starting a second database. Two
 consequences worth knowing:
