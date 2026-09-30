@@ -12,8 +12,10 @@ import pytest
 import torch
 
 from ecg.data.datasets import (
+    LEAK_PAIRS,
     Cohort,
     EcgBatches,
+    assert_patient_disjoint,
     build_cohorts,
     describe_cohorts,
     nested_subsets,
@@ -220,3 +222,43 @@ class TestBuildCohorts:
         table = describe_cohorts(build_cohorts(ptbxl_metadata))
         assert "n_records" in table.columns
         assert set(SUPERCLASSES) <= set(table.columns)
+
+
+class TestAssertPatientDisjoint:
+    def test_published_folds_pass(self, ptbxl_metadata: pd.DataFrame) -> None:
+        assert_patient_disjoint(build_cohorts(ptbxl_metadata), ptbxl_metadata)
+
+    def test_ssl_pool_is_checked_against_the_held_out_folds(self) -> None:
+        # The gap this closes: arms C and D pretrain on "ssl", and it was the
+        # one cohort the assertion never looked at.
+        assert ("ssl", "val") in LEAK_PAIRS
+        assert ("ssl", "test") in LEAK_PAIRS
+
+    def test_ssl_may_share_patients_with_train(self) -> None:
+        # Not a leak but the design: the pool is folds 1-8 entire, so it
+        # contains every supervised training record.
+        assert ("ssl", "train") not in LEAK_PAIRS
+        assert ("train", "ssl") not in LEAK_PAIRS
+
+    def test_a_patient_in_ssl_and_test_is_caught(
+        self, ptbxl_metadata: pd.DataFrame
+    ) -> None:
+        cohorts = build_cohorts(ptbxl_metadata)
+        stolen = cohorts["test"].ecg_ids[:1]
+        cohorts["ssl"] = Cohort(
+            name="ssl",
+            ecg_ids=np.concatenate([cohorts["ssl"].ecg_ids, stolen]),
+            labels=np.concatenate(
+                [cohorts["ssl"].labels, cohorts["test"].labels[:1]]
+            ),
+        )
+        with pytest.raises(AssertionError, match="patient leakage"):
+            assert_patient_disjoint(cohorts, ptbxl_metadata)
+
+    def test_a_missing_cohort_is_an_error_not_a_pass(
+        self, ptbxl_metadata: pd.DataFrame
+    ) -> None:
+        cohorts = build_cohorts(ptbxl_metadata)
+        del cohorts["ssl"]
+        with pytest.raises(ValueError, match="no cohort named"):
+            assert_patient_disjoint(cohorts, ptbxl_metadata)

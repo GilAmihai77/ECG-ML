@@ -160,66 +160,140 @@ def nested_subsets(
 
 
 def holdout_split(
-    cohort: Cohort, fraction: float, *, seed: int = 0
+    cohort: Cohort, fraction: float, *, patient_ids: np.ndarray, seed: int = 0
 ) -> tuple[Cohort, Cohort]:
-    """Split a cohort into a larger part and a held-out part.
+    """Split a cohort into a larger part and a held-out part, by patient.
 
-    Used to carve a reconstruction-validation slice out of the SSL pool. The
-    slice is taken from the pool itself rather than from the supervised
+    Used to carve a reconstruction-validation slice out of the SSL pool. Two
+    properties matter here, and the second one was wrong for a while.
+
+    The slice comes from the pool itself rather than from the supervised
     validation split, so pretraining never observes a cohort that is later used
     for model selection -- pretraining and fine-tuning would otherwise share an
     early-stopping signal.
 
+    **Whole patients move together.** Unlike the supervised training cohort,
+    which holds one record per patient, the SSL pool is folds 1-8 unfiltered:
+    17,418 records from 15,023 patients. Splitting it by record put about a
+    fifth of the held-out records in the same patient as a record still being
+    trained on, so the reconstruction loss selecting the pretraining checkpoint
+    was measured partly on patients the encoder had already seen. Nothing
+    reported to the study came through that number, but it is the one split in
+    the project that was not patient-wise (integrity rule 1).
+
     Args:
         cohort: Cohort to split.
-        fraction: Fraction held out, in ``[0, 1)``.
-        seed: Seed for the permutation (integrity rule 4).
+        fraction: Approximate fraction of *records* to hold out, in ``[0, 1)``.
+            Patients are indivisible, so the realised holdout is the smallest
+            whole number of patients that reaches it.
+        patient_ids: Patient of each record, aligned with ``cohort.ecg_ids``.
+            Required rather than defaulted: an optional grouping would silently
+            restore the record-wise split this function exists to prevent.
+        seed: Seed for the patient permutation (integrity rule 4).
 
     Returns:
-        ``(kept, held_out)``. ``held_out`` is empty when ``fraction`` is zero.
+        ``(kept, held_out)``, each in cohort order. ``held_out`` is empty when
+        ``fraction`` is zero.
 
     Raises:
-        ValueError: If ``fraction`` is outside ``[0, 1)``.
+        ValueError: If ``fraction`` is outside ``[0, 1)``, if ``patient_ids``
+            does not carry one entry per record, or if the draw would hold out
+            every patient and leave nothing to train on.
     """
     if not 0.0 <= fraction < 1.0:
         raise ValueError(f"fraction must be in [0, 1), got {fraction}")
 
-    order = np.random.default_rng(seed).permutation(len(cohort))
-    n_held = int(round(len(cohort) * fraction))
+    patients = np.asarray(patient_ids)
+    if patients.shape != (len(cohort),):
+        raise ValueError(
+            f"patient_ids must hold one entry per record: got shape "
+            f"{patients.shape} for a cohort of {len(cohort)} records"
+        )
+
+    n_target = int(round(len(cohort) * fraction))
+    if n_target == 0:
+        return (
+            cohort.subset(np.arange(len(cohort)), name=f"{cohort.name}-train"),
+            cohort.subset(np.array([], dtype=np.int64), name=f"{cohort.name}-holdout"),
+        )
+
+    # np.unique sorts, so the patient order the permutation is applied to does
+    # not depend on the cohort's row order -- only on the seed.
+    unique, counts = np.unique(patients, return_counts=True)
+    order = np.random.default_rng(seed).permutation(len(unique))
+    # First prefix of patients whose records reach the target. searchsorted
+    # never undershoots, so the holdout is at least the requested size.
+    reached = int(np.searchsorted(np.cumsum(counts[order]), n_target, side="left")) + 1
+    held = np.isin(patients, unique[order[:reached]])
+
+    if bool(held.all()):
+        raise ValueError(
+            f"fraction {fraction} holds out every patient of {cohort.name!r}, "
+            "leaving nothing to train on"
+        )
     return (
-        cohort.subset(order[n_held:], name=f"{cohort.name}-train"),
-        cohort.subset(order[:n_held], name=f"{cohort.name}-holdout"),
+        cohort.subset(np.flatnonzero(~held), name=f"{cohort.name}-train"),
+        cohort.subset(np.flatnonzero(held), name=f"{cohort.name}-holdout"),
     )
 
 
+#: Cohort pairs that must not share a patient. ``("ssl", "train")`` is
+#: deliberately absent: the SSL pool is folds 1-8 entire, so it *contains* the
+#: supervised training records, and pretraining on a record that is later
+#: fine-tuned on is the design rather than a leak. What would be a leak is the
+#: pool reaching a held-out fold, which is why the two ``ssl`` pairs are here --
+#: arms C and D consume that cohort, and it was the one nothing checked.
+LEAK_PAIRS: tuple[tuple[str, str], ...] = (
+    ("train", "val"),
+    ("train", "test"),
+    ("val", "test"),
+    ("ssl", "val"),
+    ("ssl", "test"),
+)
+
+
 def assert_patient_disjoint(
-    cohorts: dict[str, Cohort], metadata: pd.DataFrame, *, splits: Sequence[str] = ("train", "val", "test")
+    cohorts: dict[str, Cohort],
+    metadata: pd.DataFrame,
+    *,
+    pairs: Sequence[tuple[str, str]] = LEAK_PAIRS,
 ) -> None:
-    """Fail if any patient appears in more than one split.
+    """Fail if a patient appears in two cohorts that must not share one.
 
     Integrity rule 1, made executable at the point the model actually consumes
-    the data rather than trusted from the published folds.
+    the data rather than trusted from the published folds. Called by
+    :meth:`ecg.experiments.runner.Workspace.load`, so every study checks it
+    before booking a GPU rather than only when someone runs the EDA notebook.
 
     Args:
         cohorts: Cohorts from :func:`build_cohorts`.
         metadata: Metadata frame carrying ``patient_id``.
-        splits: Splits that must not share patients.
+        pairs: Cohort pairs that must not intersect. Defaults to
+            :data:`LEAK_PAIRS`.
 
     Raises:
-        AssertionError: If any patient spans two of ``splits``.
+        AssertionError: If any patient spans a pair.
+        ValueError: If a named cohort is absent, which would otherwise let a
+            typo report success for a check that never ran.
     """
-    seen: dict[str, set[int]] = {}
-    for split in splits:
-        ids = cohorts[split].ecg_ids
-        seen[split] = set(metadata.loc[ids, "patient_id"].to_numpy().tolist())
+    named = {name for pair in pairs for name in pair}
+    missing = sorted(name for name in named if name not in cohorts)
+    if missing:
+        raise ValueError(
+            f"cannot check for patient leakage: no cohort named {missing}. "
+            f"Available: {sorted(cohorts)}"
+        )
 
-    for i, left in enumerate(splits):
-        for right in splits[i + 1 :]:
-            shared = seen[left] & seen[right]
-            assert not shared, (
-                f"patient leakage: {len(shared)} patient(s) in both {left} and "
-                f"{right}, e.g. {sorted(shared)[:5]}"
-            )
+    seen = {
+        name: set(metadata.loc[cohorts[name].ecg_ids, "patient_id"].to_numpy().tolist())
+        for name in named
+    }
+    for left, right in pairs:
+        shared = seen[left] & seen[right]
+        assert not shared, (
+            f"patient leakage: {len(shared)} patient(s) in both {left} and "
+            f"{right}, e.g. {sorted(shared)[:5]}"
+        )
 
 
 class EcgBatches:

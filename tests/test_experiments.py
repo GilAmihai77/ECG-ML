@@ -95,7 +95,13 @@ def workspace() -> Workspace:
         "test": Cohort("test", ids[48:], labels[48:]),
         "ssl": Cohort("ssl", ids[:32], labels[:32]),
     }
-    return Workspace(store=store, cohorts=cohorts)
+    # One record per patient, so the SSL holdout split has something to group
+    # by. The real pool does not look like this -- see TestHoldoutSplit.
+    metadata = pd.DataFrame(
+        {"patient_id": np.arange(1, N_RECORDS + 1, dtype=np.int64)},
+        index=pd.Index(ids, name="ecg_id"),
+    )
+    return Workspace(store=store, cohorts=cohorts, metadata=metadata)
 
 
 class TestPlan:

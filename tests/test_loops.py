@@ -261,7 +261,7 @@ class TestPretrainLoop:
             "ssl", store.ecg_ids.copy(),
             np.zeros((N_RECORDS, len(SUPERCLASSES)), dtype=np.float32),
         )
-        kept, held = holdout_split(cohort, 0.25, seed=0)
+        kept, held = holdout_split(cohort, 0.25, patient_ids=np.arange(len(cohort)), seed=0)
         result = pretrain(
             build_pretrainer(config.model, config.ssl),
             EcgBatches(store, kept, batch_size=16, seed=0),
@@ -318,7 +318,7 @@ class TestPretrainLoop:
             "ssl", store.ecg_ids.copy(),
             np.zeros((N_RECORDS, len(SUPERCLASSES)), dtype=np.float32),
         )
-        kept, held = holdout_split(cohort, 0.25, seed=0)
+        kept, held = holdout_split(cohort, 0.25, patient_ids=np.arange(len(cohort)), seed=0)
         # lr small enough that the holdout loss cannot improve, so patience
         # fires rather than the budget running out.
         patient = config.with_(
@@ -343,7 +343,7 @@ class TestPretrainLoop:
             "ssl", store.ecg_ids.copy(),
             np.zeros((N_RECORDS, len(SUPERCLASSES)), dtype=np.float32),
         )
-        kept, held = holdout_split(cohort, 0.25, seed=0)
+        kept, held = holdout_split(cohort, 0.25, patient_ids=np.arange(len(cohort)), seed=0)
         patient = config.with_(
             train=TrainConfig(
                 epochs=40, batch_size=16, lr=1e-9, amp=False, device="cpu", patience=2
@@ -392,7 +392,7 @@ class TestPretrainLoop:
             "ssl", store.ecg_ids.copy(),
             np.zeros((N_RECORDS, len(SUPERCLASSES)), dtype=np.float32),
         )
-        kept, held = holdout_split(cohort, 0.25, seed=0)
+        kept, held = holdout_split(cohort, 0.25, patient_ids=np.arange(len(cohort)), seed=0)
         with warnings.catch_warnings():
             warnings.simplefilter("error", RuntimeWarning)
             pretrain(
@@ -414,7 +414,7 @@ class TestPretrainLoop:
             "ssl", store.ecg_ids.copy(),
             np.zeros((N_RECORDS, len(SUPERCLASSES)), dtype=np.float32),
         )
-        kept, held = holdout_split(cohort, 0.25, seed=0)
+        kept, held = holdout_split(cohort, 0.25, patient_ids=np.arange(len(cohort)), seed=0)
         longer = config.with_(
             train=TrainConfig(
                 epochs=2, ssl_epochs=6, batch_size=16, amp=False, device="cpu"
@@ -440,7 +440,7 @@ class TestCheckpointThrottling:
             "ssl", store.ecg_ids.copy(),
             np.zeros((N_RECORDS, len(SUPERCLASSES)), dtype=np.float32),
         )
-        return holdout_split(cohort, 0.25, seed=0)
+        return holdout_split(cohort, 0.25, patient_ids=np.arange(len(cohort)), seed=0)
 
     @staticmethod
     def _run(store, config, cohorts, **train):
@@ -520,7 +520,7 @@ class TestSnapshots:
             "ssl", store.ecg_ids.copy(),
             np.zeros((N_RECORDS, len(SUPERCLASSES)), dtype=np.float32),
         )
-        return holdout_split(cohort, 0.25, seed=0)
+        return holdout_split(cohort, 0.25, patient_ids=np.arange(len(cohort)), seed=0)
 
     def test_they_are_written_on_the_period(self, store, config, cohorts) -> None:
         kept, held = cohorts
@@ -614,24 +614,60 @@ class TestHoldoutSplit:
         cohort = Cohort(
             "ssl", np.arange(1, 101), np.zeros((100, 5), dtype=np.float32)
         )
-        kept, held = holdout_split(cohort, 0.1, seed=0)
+        kept, held = holdout_split(cohort, 0.1, patient_ids=np.arange(len(cohort)), seed=0)
         assert len(kept) == 90
         assert len(held) == 10
         assert not set(kept.ecg_ids.tolist()) & set(held.ecg_ids.tolist())
 
     def test_zero_fraction_holds_nothing_out(self) -> None:
         cohort = Cohort("ssl", np.arange(1, 11), np.zeros((10, 5), dtype=np.float32))
-        kept, held = holdout_split(cohort, 0.0)
+        kept, held = holdout_split(cohort, 0.0, patient_ids=np.arange(len(cohort)))
         assert len(kept) == 10
         assert len(held) == 0
 
     def test_is_reproducible(self) -> None:
         cohort = Cohort("ssl", np.arange(1, 101), np.zeros((100, 5), dtype=np.float32))
-        a = holdout_split(cohort, 0.2, seed=7)[1]
-        b = holdout_split(cohort, 0.2, seed=7)[1]
+        a = holdout_split(cohort, 0.2, patient_ids=np.arange(len(cohort)), seed=7)[1]
+        b = holdout_split(cohort, 0.2, patient_ids=np.arange(len(cohort)), seed=7)[1]
         np.testing.assert_array_equal(a.ecg_ids, b.ecg_ids)
 
     def test_invalid_fraction_is_rejected(self) -> None:
         cohort = Cohort("ssl", np.arange(1, 11), np.zeros((10, 5), dtype=np.float32))
         with pytest.raises(ValueError, match=r"\[0, 1\)"):
-            holdout_split(cohort, 1.0)
+            holdout_split(cohort, 1.0, patient_ids=np.arange(len(cohort)))
+
+    def test_no_patient_spans_both_parts(self) -> None:
+        # The bug this replaced: the SSL pool holds several records per patient,
+        # so a record-wise split measured reconstruction on patients the encoder
+        # had already trained on. Three records each, so a record-wise split
+        # would almost surely split someone.
+        cohort = Cohort(
+            "ssl", np.arange(1, 91), np.zeros((90, 5), dtype=np.float32)
+        )
+        patients = np.repeat(np.arange(30), 3)
+        for seed in range(5):
+            kept, held = holdout_split(cohort, 0.2, patient_ids=patients, seed=seed)
+            kept_patients = set(patients[kept.ecg_ids - 1].tolist())
+            held_patients = set(patients[held.ecg_ids - 1].tolist())
+            assert not kept_patients & held_patients
+            assert len(kept) + len(held) == len(cohort)
+
+    def test_holdout_reaches_the_requested_size(self) -> None:
+        # Patients are indivisible, so the fraction is approximate -- but it
+        # rounds up, never silently down to nothing.
+        cohort = Cohort(
+            "ssl", np.arange(1, 91), np.zeros((90, 5), dtype=np.float32)
+        )
+        patients = np.repeat(np.arange(30), 3)
+        _, held = holdout_split(cohort, 0.2, patient_ids=patients, seed=0)
+        assert 18 <= len(held) <= 20  # 18 = ceil to whole patients of 0.2 * 90
+
+    def test_misaligned_patient_ids_are_rejected(self) -> None:
+        cohort = Cohort("ssl", np.arange(1, 11), np.zeros((10, 5), dtype=np.float32))
+        with pytest.raises(ValueError, match="one entry per record"):
+            holdout_split(cohort, 0.2, patient_ids=np.arange(3))
+
+    def test_holding_out_every_patient_is_rejected(self) -> None:
+        cohort = Cohort("ssl", np.arange(1, 11), np.zeros((10, 5), dtype=np.float32))
+        with pytest.raises(ValueError, match="nothing to train on"):
+            holdout_split(cohort, 0.9, patient_ids=np.zeros(10, dtype=int))

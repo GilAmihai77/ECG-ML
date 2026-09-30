@@ -339,7 +339,7 @@ print(f"store: {len(store)} records, {store.n_samples} samples, {store.sampling_
 assert len(store) == 21799, f"expected 21799 records, got {len(store)}"
 
 assert_patient_disjoint(cohorts, metadata)
-print("patient-disjoint: ok\\n")
+print("patient-disjoint: ok (train/val/test, and the SSL pool against both held-out folds)\\n")
 print(describe_cohorts(cohorts).to_string())
 """
 )
@@ -475,9 +475,14 @@ code(
 import pandas as pd
 
 ablation = pd.read_csv(RUNS / "ablation" / "results.csv")
+# val only. The runs do score test -- every supervised run does -- but a
+# selection table that prints it invites the eye to do what integrity rule 2
+# forbids the code from doing, and there is no way to prove afterwards that it
+# did not. The test column is in results.csv if it is ever needed for something
+# that is not a choice.
 table = (
     ablation[ablation["kind"] == "supervised"]
-    .loc[:, ["mask_ratio", "val_macro_auroc", "test_macro_auroc"]]
+    .loc[:, ["mask_ratio", "val_macro_auroc"]]
     .sort_values("mask_ratio")
 )
 print(table.to_string(index=False))

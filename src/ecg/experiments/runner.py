@@ -33,7 +33,14 @@ import numpy as np
 import pandas as pd
 import torch
 
-from ecg.data.datasets import Cohort, EcgBatches, build_cohorts, holdout_split, nested_subsets
+from ecg.data.datasets import (
+    Cohort,
+    EcgBatches,
+    assert_patient_disjoint,
+    build_cohorts,
+    holdout_split,
+    nested_subsets,
+)
 from ecg.data.preprocess import WaveformStore
 from ecg.data.ptbxl import load_metadata
 from ecg.models.encoder import build_classifier
@@ -158,24 +165,50 @@ class Workspace:
     Attributes:
         store: The waveform store.
         cohorts: Train, val, test and the SSL pool.
+        metadata: The metadata frame the cohorts were cut from. Kept rather
+            than discarded because two things downstream need ``patient_id``:
+            the leak assertion, and the patient-wise SSL holdout split.
     """
 
     store: WaveformStore
     cohorts: dict[str, Cohort]
+    metadata: pd.DataFrame
 
     @classmethod
     def load(cls, config: RunConfig) -> Workspace:
         """Load the store and cohorts named by a configuration.
+
+        Checks for patient leakage before returning (integrity rule 1). The
+        published folds are patient-wise, so this passes today; it runs anyway,
+        because the cost is one groupby against a study that would otherwise
+        have no executable guarantee at all.
 
         Args:
             config: Any run configuration from the study.
 
         Returns:
             The workspace.
+
+        Raises:
+            AssertionError: If any patient spans a pair in
+                :data:`ecg.data.datasets.LEAK_PAIRS`.
         """
         store = WaveformStore.load(config.store_path)
-        cohorts = build_cohorts(load_metadata(config.metadata_path))
-        return cls(store=store, cohorts=cohorts)
+        metadata = load_metadata(config.metadata_path)
+        cohorts = build_cohorts(metadata)
+        assert_patient_disjoint(cohorts, metadata)
+        return cls(store=store, cohorts=cohorts, metadata=metadata)
+
+    def patients_of(self, cohort: Cohort) -> np.ndarray:
+        """Patient id per record of a cohort, aligned with its ``ecg_ids``.
+
+        Args:
+            cohort: Any cohort cut from :attr:`metadata`.
+
+        Returns:
+            ``(len(cohort),)`` array of patient ids.
+        """
+        return self.metadata.loc[cohort.ecg_ids, "patient_id"].to_numpy()
 
 
 def run_one(
@@ -827,7 +860,12 @@ def _run_pretrain(
 ) -> RunOutcome:
     """Execute a pretraining run."""
     pool = workspace.cohorts["ssl"]
-    kept, held = holdout_split(pool, config.ssl_holdout, seed=config.subset_seed)
+    kept, held = holdout_split(
+        pool,
+        config.ssl_holdout,
+        patient_ids=workspace.patients_of(pool),
+        seed=config.subset_seed,
+    )
     # Before the model exists, not after: weight initialisation draws from the
     # global generator, and the loop's own set_seed comes too late to govern a
     # model its caller already built. See _seeded_model.

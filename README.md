@@ -61,7 +61,7 @@ src/ecg/training/      loops, metrics, checkpoints, MLflow tracking
 src/ecg/experiments/   the run grid, runner, CLI, reporting
 notebooks/             EDA, Colab runner, MLflow exploration
 docs/                  tokenizer comparison write-up, architecture notes
-tests/                 488 tests
+tests/                 504 tests
 ```
 
 ## Usage
