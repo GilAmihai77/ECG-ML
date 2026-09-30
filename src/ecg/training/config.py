@@ -61,12 +61,13 @@ class TrainConfig:
         ssl_epochs: Epochs for pretraining runs; ``0`` means ``epochs``.
 
             Pretraining and fine-tuning want budgets that differ by an order of
-            magnitude. The SSL pool is 17,418 records against 10,254 labelled
-            ones, and masked reconstruction needs far more passes to say
-            anything than a five-class head does -- 50 epochs is 3,250 SSL steps
-            at batch 256, which is very few. Without this field one number set
-            both, so raising it for pretraining also bought 600-epoch
-            fine-tunes nobody asked for, and those are 60 of the 70 runs.
+            magnitude. The SSL pool is 17,418 records -- folds 1-8 entire, the
+            10,254 labelled ones included -- and masked reconstruction needs far
+            more passes to say anything than a five-class head does -- 50 epochs
+            is 3,250 SSL steps at batch 256, which is very few. Without this
+            field one number set both, so raising it for pretraining also bought
+            600-epoch fine-tunes nobody asked for, and those are 60 of the 70
+            runs.
         ssl_schedule_epochs: ``schedule_epochs`` for pretraining runs; ``0``
             means ``ssl_epochs``, i.e. anneal across the whole SSL budget.
             That is usually what a pretraining run wants: it is one long run

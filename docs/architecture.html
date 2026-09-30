@@ -248,7 +248,7 @@ code{font-family:var(--mono);font-size:.9em;color:var(--ink-2)}
   <div class="slideno">Slide 2 — the four arms</div>
   <figure>
     <div class="canvas">
-      <svg viewBox="0 0 1920 1080" role="img" aria-label="Table of the four experimental arms. Arm A is a linear embedder with no pretraining, trained on 10,254 labelled records, isolating the supervised baseline for the linear embedder. Arm B is a conv stem with no pretraining on the same data, the supervised baseline for the conv stem. Arm C is a linear embedder with masked reconstruction pretraining on 17,418 unlabelled records, then fine-tuned on the same 10,254, testing whether SSL helps a linear embedder. Arm D is the conv stem with the same pretraining, testing whether SSL helps a conv stem. Three contrasts follow: A to B and C to D isolate the patch embedder at fixed pretraining; A to C and B to D isolate pretraining at fixed embedder; and the difference of differences, D minus B minus the quantity C minus A, is the interaction that asks whether the embedder changes what SSL is worth.">
+      <svg viewBox="0 0 1920 1080" role="img" aria-label="Table of the four experimental arms. Arm A is a linear embedder with no pretraining, trained on 10,254 labelled records, isolating the supervised baseline for the linear embedder. Arm B is a conv stem with no pretraining on the same data, the supervised baseline for the conv stem. Arm C is a linear embedder with masked reconstruction pretraining on all 17,418 training-fold records with their labels unused, then fine-tuned on the 10,254 labelled ones, testing whether SSL helps a linear embedder. Arm D is the conv stem with the same pretraining, testing whether SSL helps a conv stem. Three contrasts follow: A to B and C to D isolate the patch embedder at fixed pretraining; A to C and B to D isolate pretraining at fixed embedder; and the difference of differences, D minus B minus the quantity C minus A, is the interaction that asks whether the embedder changes what SSL is worth.">
         <rect class="bg" x="0" y="0" width="1920" height="1080"/>
 
         <text class="t-xl" x="80" y="88">The four arms</text>
@@ -294,7 +294,7 @@ code{font-family:var(--mono);font-size:.9em;color:var(--ink-2)}
         <text class="t-lg" x="230" y="557">Linear</text>
         <text class="t-s" x="230" y="591">one Linear(600 → 256)</text>
         <text class="t-lg hd-ssl" x="540" y="557">masked reconstruction</text>
-        <text class="t-s" x="540" y="591">17,418 unlabelled records</text>
+        <text class="t-s" x="540" y="591">17,418 records, labels unused</text>
         <text class="t-lg" x="1090" y="557" text-anchor="middle">10,254</text>
         <text class="t-s" x="1090" y="591" text-anchor="middle">records</text>
         <text class="t-m" x="1240" y="573">does SSL help a linear embedder</text>
@@ -305,7 +305,7 @@ code{font-family:var(--mono);font-size:.9em;color:var(--ink-2)}
         <text class="t-lg" x="230" y="685">Conv stem</text>
         <text class="t-s" x="230" y="719">three strided conv layers</text>
         <text class="t-lg hd-ssl" x="540" y="685">masked reconstruction</text>
-        <text class="t-s" x="540" y="719">17,418 unlabelled records</text>
+        <text class="t-s" x="540" y="719">17,418 records, labels unused</text>
         <text class="t-lg" x="1090" y="685" text-anchor="middle">10,254</text>
         <text class="t-s" x="1090" y="719" text-anchor="middle">records</text>
         <text class="t-m" x="1240" y="701">does SSL help a conv stem</text>
